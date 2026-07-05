@@ -19,6 +19,7 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - 📊 **Histogram analysis** — Claude checks clipping and tonal distribution before suggesting edits
 - 💾 **Non-destructive** — all edits stored in a sidecar JSON; originals never touched
 - 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars Darktable can read
+- 🏷️ **Metadata preserved** — camera, ISO, shutter, aperture, focal length and capture time carried into exports, with orientation handled correctly (toggle with `preserve_metadata`)
 - 📋 **Batch copy settings** — apply one image's edits to many others
 
 ---

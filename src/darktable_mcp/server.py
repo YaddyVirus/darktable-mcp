@@ -380,6 +380,7 @@ def export_image(
     use_darktable_cli: bool = True,
     write_xmp_sidecar: bool = True,
     max_dimension: Optional[int] = None,
+    preserve_metadata: bool = True,
 ) -> dict:
     """Export the edited image to a file.
 
@@ -399,6 +400,11 @@ def export_image(
         Write a Darktable-compatible XMP sidecar alongside the source file.
     max_dimension : int, optional
         Resize so the longest edge is at most this many pixels.
+    preserve_metadata : bool
+        Carry the source's EXIF metadata (camera, lens, ISO, shutter, aperture,
+        focal length, capture time) into the exported file.  When False, the
+        output is stripped of EXIF.  Only applies to JPEG/TIFF output; PNG is
+        always stripped.  Defaults to True.
     """
     try:
         path, state = _load_or_new(image_path)
@@ -431,7 +437,11 @@ def export_image(
     if use_darktable_cli and DARKTABLE_CLI and path.suffix.lower() in RAW_EXTENSIONS:
         result = _export_via_darktable_cli(path, out_path, xmp_path, quality)
         if result.get("status") == "ok":
+            # darktable-cli preserves source EXIF by default; strip it on request.
+            if not preserve_metadata:
+                _strip_metadata(out_path)
             result["xmp_sidecar"] = str(xmp_path) if xmp_path else None
+            result["metadata_preserved"] = preserve_metadata
             return result
 
     # Fall back to rawpy + Pillow
@@ -452,6 +462,11 @@ def export_image(
 
     img.save(out_path, **save_kwargs)
 
+    # Pillow drops EXIF on save; copy the source's metadata back when requested.
+    metadata_preserved = False
+    if preserve_metadata and ext in (".jpg", ".tif"):
+        metadata_preserved = _copy_source_metadata(path, out_path)
+
     return {
         "status": "ok",
         "output_path": str(out_path),
@@ -459,6 +474,7 @@ def export_image(
         "size_bytes": out_path.stat().st_size,
         "xmp_sidecar": str(xmp_path) if xmp_path else None,
         "rendered_via": "rawpy+pillow",
+        "metadata_preserved": metadata_preserved,
     }
 
 
@@ -480,6 +496,103 @@ def _export_via_darktable_cli(
         return {"status": "error", "stderr": result.stderr[:500]}
     except Exception as exc:
         return {"status": "error", "exception": str(exc)}
+
+
+def _strip_metadata(dst: Path) -> bool:
+    """Remove EXIF metadata from a JPEG/TIFF output.  Best-effort."""
+    import piexif
+
+    try:
+        piexif.remove(str(dst))
+        return True
+    except Exception:
+        return False
+
+
+def _copy_source_metadata(src: Path, dst: Path) -> bool:
+    """Copy the source image's EXIF into an exported JPEG/TIFF.
+
+    Tries to read the source's full EXIF directly; for RAW files (where that
+    usually is not possible with piexif) it synthesises a minimal EXIF block
+    from the shooting parameters rawpy exposes.
+
+    Orientation is handled per rendering path: rawpy bakes the camera flip into
+    upright pixels when decoding RAW, so the exported orientation tag is reset
+    to 1.  The raster pipeline does *not* transpose pixels, so a raster source's
+    original orientation tag is preserved unchanged.  Best-effort — returns
+    False if nothing could be written.
+    """
+    import piexif
+
+    is_raw = src.suffix.lower() in RAW_EXTENSIONS
+
+    exif_dict: Optional[dict] = None
+    try:
+        exif_dict = piexif.load(str(src))
+    except Exception:
+        exif_dict = None
+
+    if not exif_dict or not (exif_dict.get("0th") or exif_dict.get("Exif")):
+        exif_dict = _exif_from_rawpy(src)
+
+    if not exif_dict:
+        return False
+
+    # RAW pixels come out of rawpy already upright; tell viewers not to rotate
+    # again.  Raster pixels are untouched, so keep the source orientation tag.
+    if is_raw:
+        exif_dict.setdefault("0th", {})[piexif.ImageIFD.Orientation] = 1
+    # Thumbnail bytes from the source no longer match the exported image.
+    exif_dict["thumbnail"] = None
+    exif_dict.pop("1st", None)
+
+    try:
+        piexif.insert(piexif.dump(exif_dict), str(dst))
+        return True
+    except Exception:
+        return False
+
+
+def _exif_from_rawpy(src: Path) -> Optional[dict]:
+    """Build a minimal EXIF dict from rawpy metadata for a RAW file."""
+    if src.suffix.lower() not in RAW_EXTENSIONS:
+        return None
+    import piexif
+    import rawpy
+
+    def _rational(value: float, denom: int = 1000) -> tuple[int, int]:
+        return (int(round(value * denom)), denom)
+
+    zeroth: dict = {}
+    exif: dict = {}
+    try:
+        with rawpy.imread(str(src)) as raw:
+            meta = raw.metadata
+            if getattr(meta, "make", None):
+                zeroth[piexif.ImageIFD.Make] = str(meta.make)
+            if getattr(meta, "camera", None):
+                zeroth[piexif.ImageIFD.Model] = str(meta.camera)
+            if getattr(meta, "iso", 0):
+                exif[piexif.ExifIFD.ISOSpeedRatings] = int(meta.iso)
+            if getattr(meta, "shutter", 0):
+                exif[piexif.ExifIFD.ExposureTime] = _rational(meta.shutter, 100000)
+            if getattr(meta, "aperture", 0):
+                exif[piexif.ExifIFD.FNumber] = _rational(meta.aperture)
+            if getattr(meta, "focal_len", 0):
+                exif[piexif.ExifIFD.FocalLength] = _rational(meta.focal_len)
+            ts = getattr(meta, "timestamp", 0)
+            if ts:
+                import time
+
+                dt = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime(ts))
+                exif[piexif.ExifIFD.DateTimeOriginal] = dt
+                zeroth[piexif.ImageIFD.DateTime] = dt
+    except Exception:
+        return None
+
+    if not zeroth and not exif:
+        return None
+    return {"0th": zeroth, "Exif": exif, "GPS": {}, "1st": {}, "thumbnail": None}
 
 
 @mcp.tool()
