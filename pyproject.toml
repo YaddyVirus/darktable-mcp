@@ -4,15 +4,31 @@ build-backend = "hatchling.build"
 
 [project]
 name = "darktable-mcp"
-version = "0.1.0"
-description = "MCP server for Darktable photo editing via Claude"
+version = "0.2.0"
+description = "MCP server for AI-powered photo editing — delegates RAW rendering to darktable-cli when available"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Yadullah Abidi", github = "YaddyVirus" },
+    { name = "Yuri Schmaltz",  github = "yuri-schmaltz" },
+]
 dependencies = [
     "mcp>=1.0.0",
-    "rawpy>=0.18.0",
+    "rawpy>=0.18.0; platform_system != 'Darwin' or python_version < '3.13'",
     "Pillow>=10.0.0",
     "numpy>=1.24.0",
-    "piexif>=1.1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+raw = [
+    # rawpy is the fallback RAW decoder; required only if you want to render
+    # RAW without darktable-cli installed.
+    "rawpy>=0.18.0",
 ]
 
 [project.scripts]
@@ -23,3 +39,7 @@ packages = ["src/darktable_mcp"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

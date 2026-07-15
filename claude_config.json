@@ -1,13 +1,8 @@
 {
-  "_comment": "Add the block below to the 'mcpServers' section of your Claude Desktop config file.",
-  "_config_path_windows": "%APPDATA%\\Claude\\claude_desktop_config.json",
-  "_config_path_mac": "~/Library/Application Support/Claude/claude_desktop_config.json",
-
   "mcpServers": {
     "darktable": {
       "command": "python",
-      "args": ["-m", "darktable_mcp"],
-      "cwd": "D:\\Dev\\DarktableMCP"
+      "args": ["-m", "darktable_mcp"]
     }
   }
 }

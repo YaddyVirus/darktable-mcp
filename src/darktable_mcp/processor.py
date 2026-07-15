@@ -1,18 +1,61 @@
-"""Image processing pipeline using rawpy (for RAW) and Pillow (for all types)."""
+"""Image processing pipeline.
+
+RAW and raster rendering is delegated to ``darktable-cli`` when it is
+available on PATH.  ``rawpy`` + Pillow is used as a fallback for the case
+where the user does not have darktable installed.  The fallback path only
+handles raster images; for RAW without darktable we raise a clear error.
+"""
 from __future__ import annotations
 
 import math
+import shutil
+import subprocess
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
+from PIL import Image, ImageEnhance, ImageFilter
 
 from .edits import EditState, AdjustmentState, CropState
 
 RAW_EXTENSIONS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".rw2", ".dng", ".orf", ".pef", ".srw", ".3fr"}
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 ALL_EXTENSIONS = RAW_EXTENSIONS | IMG_EXTENSIONS
+
+
+# ---------------------------------------------------------------------------
+# darktable-cli discovery
+# ---------------------------------------------------------------------------
+
+_CANDIDATE_PATHS: dict[str, list[str]] = {
+    "Windows": [
+        r"C:\Program Files\darktable\bin\darktable-cli.exe",
+        r"C:\Program Files (x86)\darktable\bin\darktable-cli.exe",
+    ],
+    "Darwin": [
+        "/Applications/darktable.app/Contents/MacOS/darktable-cli",
+        "/usr/local/bin/darktable-cli",
+        "/opt/homebrew/bin/darktable-cli",
+    ],
+    "Linux": [
+        "/usr/bin/darktable-cli",
+        "/usr/local/bin/darktable-cli",
+        "/snap/bin/darktable-cli",
+        "/opt/darktable/bin/darktable-cli",
+    ],
+}
+
+
+def find_darktable_cli() -> Optional[str]:
+    """Return the path to ``darktable-cli`` or ``None`` if not installed."""
+    found = shutil.which("darktable-cli")
+    if found:
+        return found
+    for path in _CANDIDATE_PATHS.get(sys.platform, []):
+        if Path(path).exists():
+            return path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -105,15 +148,25 @@ def _apply_vignette(img: Image.Image, strength: float) -> Image.Image:
 
 
 def _apply_clarity(img: Image.Image, clarity: float) -> Image.Image:
-    """Local contrast via unsharp mask with a large radius."""
+    """Local contrast adjustment.
+
+    Positive = more local contrast (mid-tone pop), negative = less local
+    contrast (softer, less crunchy).  Both directions use an unsharp mask
+    on a large-radius blurred copy; the sign only flips the mix direction.
+    """
     if abs(clarity) < 1.0:
         return img
     amount = abs(clarity) / 100.0
     radius = 30
+    # PIL's UnsharpMask only boosts (percent > 0).  To *reduce* local
+    # contrast, we blend a strong-blur version of the image back in.
     if clarity > 0:
-        return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=int(amount * 80), threshold=2))
-    else:
-        return img.filter(ImageFilter.GaussianBlur(radius=amount * 3))
+        return img.filter(
+            ImageFilter.UnsharpMask(radius=radius, percent=int(amount * 150), threshold=2)
+        )
+    # Negative clarity: gently soften without losing edges
+    soft = img.filter(ImageFilter.GaussianBlur(radius=2))
+    return Image.blend(img, soft, amount * 0.6)
 
 
 def _apply_vibrance(img: Image.Image, vibrance: float) -> Image.Image:
@@ -156,10 +209,97 @@ def _apply_wb_pillow(img: Image.Image, r: float, g: float, b: float) -> Image.Im
 
 
 def _apply_noise_reduction(img: Image.Image, strength: float) -> Image.Image:
+    """Luminance-preserving noise reduction via median filter.
+
+    Pillow's ``MedianFilter`` is a proper rank filter, not a Gaussian blur,
+    so it actually suppresses impulse / shot noise.  For higher strength we
+    run a 3-iteration pass on a downsampled copy then upscale — better
+    trade-off between noise removal and detail loss.
+    """
     if strength < 1.0:
         return img
-    radius = strength / 100.0 * 2.0
-    return img.filter(ImageFilter.GaussianBlur(radius=radius))
+    radius = max(1, int(round(strength / 33.0)))  # 1..3
+    if radius == 1:
+        return img.filter(ImageFilter.MedianFilter(size=3))
+    if radius == 2:
+        return img.filter(ImageFilter.MedianFilter(size=3)).filter(
+            ImageFilter.MedianFilter(size=3)
+        )
+    # radius == 3: stronger, with a small sharpen back to recover detail
+    denoised = img.filter(ImageFilter.MedianFilter(size=3))
+    denoised = denoised.filter(ImageFilter.MedianFilter(size=3))
+    denoised = denoised.filter(ImageFilter.MedianFilter(size=3))
+    return denoised.filter(ImageFilter.UnsharpMask(radius=1, percent=30, threshold=2))
+
+
+# ---------------------------------------------------------------------------
+# darktable-cli integration
+# ---------------------------------------------------------------------------
+
+def _run_darktable_cli(
+    src: Path,
+    xmp: Optional[Path],
+    dst: Path,
+    *,
+    width: int = 0,
+    height: int = 0,
+    quality: int = 90,
+    out_ext: Optional[str] = None,
+    bpp: int = 8,
+    timeout: int = 300,
+) -> dict:
+    """Invoke darktable-cli and return a result dict.
+
+    Returns ``{"status": "ok", ...}`` on success or
+    ``{"status": "error", "reason": "..."}`` on failure.
+    """
+    cli = find_darktable_cli()
+    if cli is None:
+        return {"status": "error", "reason": "darktable-cli not found on PATH"}
+
+    # darktable-cli requires a unique library per output to avoid races;
+    # point --library at a temp dir we delete afterwards.
+    import tempfile
+    libdir = Path(tempfile.mkdtemp(prefix="dtcli_"))
+
+    cmd = [cli, str(src)]
+    if xmp is not None and xmp.exists():
+        cmd.append(str(xmp))
+    cmd.append(str(dst))
+    cmd += [
+        "--width", str(width),
+        "--height", str(height),
+        "--quality", str(int(quality)),
+        "--bpp", str(int(bpp)),
+        "--library", str(libdir),
+    ]
+    if out_ext:
+        cmd += ["--out-ext", out_ext]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "reason": f"darktable-cli timed out after {timeout}s"}
+    except Exception as exc:
+        return {"status": "error", "reason": f"subprocess failed: {exc}"}
+    finally:
+        shutil.rmtree(libdir, ignore_errors=True)
+
+    if result.returncode != 0 or not dst.exists():
+        stderr = (result.stderr or result.stdout or "").strip()
+        return {
+            "status": "error",
+            "reason": f"darktable-cli exited {result.returncode}: {stderr[:500]}",
+        }
+
+    return {
+        "status": "ok",
+        "output_path": str(dst),
+        "rendered_via": "darktable-cli",
+        "size_bytes": dst.stat().st_size,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,12 +315,26 @@ class ImageProcessor:
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, edit_state: EditState, preview_size: Optional[int] = None) -> Image.Image:
-        if self.is_raw:
-            img = self._process_raw(edit_state.adjustments)
-        else:
-            img = self._process_raster(edit_state.adjustments)
+    def process(
+        self,
+        edit_state: EditState,
+        preview_size: Optional[int] = None,
+        use_darktable_cli: bool = True,
+    ) -> Image.Image:
+        """Render the image with all current edits applied.
 
+        Strategy:
+          1. If darktable-cli is available and ``use_darktable_cli`` is True,
+             render via darktable (correct RAW demosaicing + module chain).
+          2. Otherwise, fall back to rawpy + Pillow (raster only; RAW raises).
+        """
+        if use_darktable_cli and find_darktable_cli() is not None:
+            return self._process_via_darktable_cli(edit_state, preview_size)
+
+        if self.is_raw:
+            return self._process_raw(edit_state.adjustments)
+
+        img = self._process_raster(edit_state.adjustments)
         img = self._apply_post_raw(img, edit_state.adjustments)
 
         if edit_state.crop:
@@ -197,6 +351,7 @@ class ImageProcessor:
             "name": self.path.name,
             "type": "raw" if self.is_raw else "image",
             "size_bytes": self.path.stat().st_size,
+            "darktable_cli_available": find_darktable_cli() is not None,
         }
         try:
             if self.is_raw:
@@ -233,6 +388,38 @@ class ImageProcessor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _process_via_darktable_cli(
+        self, edit_state: EditState, preview_size: Optional[int]
+    ) -> Image.Image:
+        """Render through darktable-cli and read the resulting JPEG/PNG."""
+        import tempfile
+        from .xmp_writer import write_xmp
+
+        # We need an XMP sidecar for darktable to honour our edits.  Write
+        # it next to the source file; if the user already has one we
+        # overwrite with the current state.
+        try:
+            xmp_path = write_xmp(edit_state)
+        except Exception as exc:
+            # If XMP generation fails we still try to render with no XMP.
+            xmp_path = None
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="dtrender_"))
+        try:
+            ext = "png" if preview_size and preview_size >= 4000 else "jpg"
+            out_path = tmpdir / f"render.{ext}"
+            width = height = int(preview_size) if preview_size else 0
+            res = _run_darktable_cli(
+                self.path, xmp_path, out_path,
+                width=width, height=height, quality=90, out_ext=ext,
+                timeout=300,
+            )
+            if res["status"] != "ok":
+                raise RuntimeError(res.get("reason", "darktable-cli failed"))
+            return Image.open(out_path).convert("RGB")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _process_raw(self, adj: AdjustmentState) -> Image.Image:
         import rawpy

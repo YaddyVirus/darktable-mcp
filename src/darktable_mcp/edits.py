@@ -1,14 +1,60 @@
+"""Edit state dataclasses with persistence and validation."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import json
-from typing import Optional
+from typing import Any, Optional
 
+
+# ---------------------------------------------------------------------------
+# Parameter ranges (single source of truth for validation + docstrings)
+# ---------------------------------------------------------------------------
+
+RANGES: dict[str, tuple[float, float]] = {
+    "exposure_ev":         (-5.0,   5.0),
+    "black_level":         ( 0.0,   0.5),
+    "highlight_recovery":  ( 0.0,   1.0),
+    "shadow_lift":         ( 0.0,   1.0),
+    "temperature_kelvin":  (2000.0, 12000.0),
+    "tint":                (-100.0, 100.0),
+    "contrast":            (-100.0, 100.0),
+    "brightness":          (-100.0, 100.0),
+    "highlights":          (-100.0, 100.0),
+    "shadows":             (-100.0, 100.0),
+    "whites":              (-100.0, 100.0),
+    "blacks":              (-100.0, 100.0),
+    "saturation":          (-100.0, 100.0),
+    "vibrance":            (-100.0, 100.0),
+    "sharpness":           (  0.0, 100.0),
+    "noise_reduction":     (  0.0, 100.0),
+    "vignette":            (-100.0, 100.0),
+    "clarity":             (-100.0, 100.0),
+}
+
+
+class ValidationError(ValueError):
+    """Raised when a parameter value is outside its allowed range."""
+
+
+def validate_param(name: str, value: Any) -> None:
+    """Raise ValidationError if *value* is outside the range declared in RANGES."""
+    if name not in RANGES:
+        return
+    lo, hi = RANGES[name]
+    if not isinstance(value, (int, float)):
+        raise ValidationError(f"{name!r} must be a number, got {type(value).__name__}")
+    if not (lo <= float(value) <= hi):
+        raise ValidationError(f"{name!r}={value} is out of range [{lo}, {hi}]")
+
+
+# ---------------------------------------------------------------------------
+# State dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CropState:
-    left: float = 0.0    # normalised 0.0–1.0
+    left: float = 0.0      # normalised 0.0–1.0
     top: float = 0.0
     right: float = 1.0
     bottom: float = 1.0
@@ -68,11 +114,13 @@ class EditState:
         sidecar = cls._sidecar(image_path)
         if not sidecar.exists():
             return None
-        with open(sidecar) as f:
-            data = json.load(f)
+        try:
+            with open(sidecar) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
         state = cls(source_path=image_path)
         adj_data = data.get("adjustments", {})
-        # Only set fields that exist in the dataclass
         valid = {k: v for k, v in adj_data.items() if hasattr(state.adjustments, k)}
         state.adjustments = AdjustmentState(**valid)
         crop_data = data.get("crop")
@@ -80,7 +128,7 @@ class EditState:
         state.output_name = data.get("output_name")
         return state
 
-    def save(self):
+    def save(self) -> Path:
         sidecar = self._sidecar(self.source_path)
         data = {
             "adjustments": asdict(self.adjustments),
@@ -89,15 +137,20 @@ class EditState:
         }
         with open(sidecar, "w") as f:
             json.dump(data, f, indent=2)
+        return sidecar
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def update(self, params: dict):
+    def update(self, params: dict, *, validate: bool = True) -> None:
+        """Apply *params* to adjustments. Raises ValidationError on bad input."""
         for key, value in params.items():
-            if hasattr(self.adjustments, key):
-                setattr(self.adjustments, key, value)
+            if not hasattr(self.adjustments, key):
+                continue
+            if validate:
+                validate_param(key, value)
+            setattr(self.adjustments, key, value)
 
     def has_changes(self) -> bool:
         defaults = AdjustmentState()
@@ -120,3 +173,11 @@ class EditState:
             "crop": asdict(self.crop) if self.crop else None,
             "output_name": self.output_name,
         }
+
+    def sidecar_paths(self) -> list[Path]:
+        """All sidecar files owned by this edit state (.mcp.json + .xmp)."""
+        paths = [self._sidecar(self.source_path)]
+        xmp = self.source_path.with_suffix(".xmp")
+        if xmp.exists():
+            paths.append(xmp)
+        return paths

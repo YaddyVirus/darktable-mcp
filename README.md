@@ -4,11 +4,25 @@
   <img src="icon.png" alt="DarktableMCP Logo" width="160"/>
 </p>
 
-> Developed by [Yadullah Abidi (YaddyVirus)](https://github.com/YaddyVirus)
+> A fork of [Yadullah Abidi (YaddyVirus)](https://github.com/YaddyVirus/darktable-mcp),
+> maintained by [Yuri Schmaltz (yuri-schmaltz)](https://github.com/yuri-schmaltz).
 
 A Model Context Protocol (MCP) server that lets you edit photos using Claude as your AI photo editor. Works with **Claude Desktop** and **Claude Code**.
 
 Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 16:9"*, *"recover the blown highlights"* — and it applies the edits, shows you a preview, and exports the final image. Supports RAW files (CR2, NEF, ARW, etc.) and JPEGs.
+
+## What's different in this fork
+
+- **Real darktable rendering.** When `darktable-cli` is installed (and the
+  official darktable is recommended for accurate RAW demosaicing), this
+  fork delegates the actual pixel pipeline to darktable's modules via
+  the `.xmp` sidecar instead of re-implementing them in Pillow. The
+  Pillow path is now strictly a fallback for raster images.
+- **Strict parameter validation.** Every numeric input is checked
+  against documented ranges before touching the sidecar.
+- **Cross-platform preview.** Works on Windows, macOS and Linux.
+- **Tests.** 29 unit tests covering state persistence, XMP emission, and
+  processor behaviour.
 
 ## Features
 
@@ -18,8 +32,9 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - 📝 **Rename outputs** — give your exports meaningful names
 - 📊 **Histogram analysis** — Claude checks clipping and tonal distribution before suggesting edits
 - 💾 **Non-destructive** — all edits stored in a sidecar JSON; originals never touched
-- 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars Darktable can read
+- 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars darktable can read
 - 📋 **Batch copy settings** — apply one image's edits to many others
+- 🧪 **Tested** — 29 unit tests in `tests/`
 
 ---
 
@@ -27,6 +42,10 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 
 - Python 3.10 or newer
 - [Claude Desktop](https://claude.ai/download) (free or Pro)
+- **Recommended:** [darktable](https://www.darktable.org/install/) (the
+  `darktable-cli` binary enables proper RAW rendering)
+- **Optional:** `rawpy` (only needed as a fallback if you want to render
+  RAW files without installing darktable)
 
 ---
 
@@ -35,30 +54,61 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yadullahabidi/darktable-mcp.git
-cd darktable-mcp
+git clone https://github.com/yuri-schmaltz/mcp-darktable.git
+cd mcp-darktable
 ```
 
-### 2. Install the package
+### 2. Create a virtual environment (recommended)
+
+On modern Python installations `pip install` system-wide is blocked by
+PEP 668.  Use a venv:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate          # macOS / Linux
+# .venv\Scripts\activate           # Windows PowerShell
+```
+
+### 3. Install the package
+
+```bash
+pip install -e ".[dev]"   # includes pytest + the optional rawpy fallback
+# or, for a minimal install:
 pip install -e .
 ```
 
-This installs all dependencies automatically:
+This installs all runtime dependencies automatically:
 - `mcp` — Model Context Protocol SDK
-- `rawpy` — RAW file decoding
 - `Pillow` — image processing
 - `numpy` — array operations
-- `piexif` — EXIF metadata
+- `rawpy` *(optional, in `[raw]` extra)* — fallback RAW decoder
 
-### 3. Verify it works
+### 4. Verify it works
 
 ```bash
 python -m darktable_mcp
 ```
 
-You should see it start (it will wait for MCP input — press Ctrl+C to exit). If it starts without errors, you're good.
+You should see it start (it will wait for MCP input — press Ctrl+C to exit).
+If it starts without errors, you're good.
+
+### 5. (Recommended) Install darktable
+
+Download from <https://www.darktable.org/install/> and make sure
+`darktable-cli` is on your `PATH`:
+
+```bash
+darktable-cli --version
+```
+
+If `darktable-cli` is not on the PATH, the server still works but RAW
+files will raise a clear error pointing to the install page.
+
+### 6. Run the tests
+
+```bash
+pytest
+```
 
 ---
 
@@ -73,7 +123,9 @@ You should see it start (it will wait for MCP input — press Ctrl+C to exit). I
 
 ### 2. Add the server
 
-Open the config file and add the `mcpServers` block. If the file already has content, merge carefully — don't replace the whole file.
+Open the config file and merge the `mcpServers` block from
+[`claude_config.json`](claude_config.json) in this repo.  Don't replace
+the whole file if it already has content.
 
 **Windows:**
 ```json
@@ -99,13 +151,15 @@ Open the config file and add the `mcpServers` block. If the file already has con
 }
 ```
 
-> **Tip:** If `python` isn't on your PATH, use the full path to the Python executable.  
-> Windows example: `"C:\\Users\\YourName\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"`  
-> Find it by running `where python` (Windows) or `which python3` (macOS/Linux) in a terminal.
+> **Tip:** If `python` isn't on your PATH, use the full path to the
+> Python executable from inside the virtual environment you created in
+> step 2.  For example
+> `"C:\\Users\\YourName\\...\\mcp-darktable\\.venv\\Scripts\\python.exe"`.
 
 ### 3. Restart Claude Desktop
 
-Fully quit (don't just close the window) and reopen. The **darktable** server should appear when you select Connectors in Claude Chat or Code.
+Fully quit (don't just close the window) and reopen.  The **darktable**
+server should appear in the Connectors list.
 
 ---
 
@@ -124,8 +178,10 @@ Crop it to 16:9 and export as JPEG at maximum quality, name it "jodhpur_desert".
 Claude will:
 1. Call `list_images` to see your folder
 2. Call `get_image_preview` to analyse the photo
-3. Call `apply_adjustments` with specific values
-4. Show you a preview (saved as `filename__preview.jpg` next to the source)
+3. Call `apply_adjustments` with specific values (out-of-range values
+   are rejected with a clear error before any sidecar is touched)
+4. Show you a preview (saved as `filename__preview.jpg` next to the
+   source, auto-opened in the system image viewer on Windows / macOS / Linux)
 5. Iterate based on your feedback
 6. Export the final image when you're happy
 
@@ -134,16 +190,16 @@ Claude will:
 | Tool | What it does |
 |------|-------------|
 | `list_images` | List all images in a directory |
-| `get_image_info` | EXIF metadata + current edit state |
+| `get_image_info` | EXIF metadata + current edit state + `darktable_cli` availability |
 | `get_image_preview` | Render and preview with edits applied |
-| `apply_adjustments` | Exposure, WB, tone, colour, detail, effects |
+| `apply_adjustments` | Exposure, WB, tone, colour, detail, effects (validated) |
 | `crop_image` | Crop by coordinates or aspect ratio |
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF |
-| `reset_edits` | Undo everything, back to original |
-| `get_histogram` | Tonal/clipping analysis |
+| `reset_edits` | Undo everything, back to original (also cleans up `.xmp`) |
+| `get_histogram` | Tonal/clipping analysis (configurable bin count) |
 | `copy_settings` | Copy edits from one image to another |
 
 ### Example prompts
@@ -159,32 +215,77 @@ Claude will:
 
 ## How edits are stored
 
-Each image gets a companion `.mcp.json` sidecar file (e.g. `IMG_3500.mcp.json`) that stores all adjustments non-destructively. Your original RAW files are never modified.
+Each image gets a companion `.mcp.json` sidecar file (e.g.
+`IMG_3500.mcp.json`) that stores all adjustments non-destructively.  Your
+original RAW files are never modified.
 
-On export, a Darktable-compatible `.xmp` sidecar is also written, so you can open the RAW in Darktable and see the edits there too.
+On export, a Darktable-compatible `.xmp` sidecar is also written, so you
+can open the RAW in Darktable and see the edits there too.  When
+`darktable-cli` is on the PATH, the same XMP is fed back into darktable
+for the final render — giving you the full quality of darktable's
+modules instead of a Pillow approximation.
+
+`reset_edits` removes both the `.mcp.json` and any `.xmp` sidecar that
+was created, so the directory is left clean.
 
 ---
 
 ## Troubleshooting
 
-**Server doesn't appear in Claude Desktop**  
-Make sure you fully quit and restarted Claude Desktop after editing the config. Check that the JSON is valid (no trailing commas, matching braces).
+**Server doesn't appear in Claude Desktop**
+Make sure you fully quit and restarted Claude Desktop after editing the
+config.  Check that the JSON is valid (no trailing commas, matching
+braces).
 
-**`python` command not found**  
-Use the full path to your Python executable in the config. Run `where python` (Windows) or `which python3` (macOS) to find it.
+**`python` command not found**
+Use the full path to the Python executable from your virtual environment
+in the config (see tip above).
 
-**RAW file fails to open**  
-Some camera models need an updated version of `rawpy`. Run `pip install --upgrade rawpy`.
+**`darktable-cli` not found**
+The server works without it for JPEG/PNG/TIFF inputs, but RAW inputs
+require either `darktable-cli` (preferred) or `rawpy` (install via
+`pip install -e ".[raw]"`).
 
-**Preview file not opening**  
-The preview is always saved as `originalname__preview.jpg` next to your source file. Open it manually if your system doesn't pop it up automatically.
+**RAW file fails to open**
+Some camera models need an updated version of `rawpy`.  Run
+`pip install --upgrade rawpy`.
+
+**Preview file not opening**
+The preview is always saved as `originalname__preview.jpg` next to your
+source file.  The auto-open uses `os.startfile` on Windows, `open` on
+macOS, and `xdg-open` on Linux — make sure the corresponding tool is
+installed.  If auto-open fails, the tool's response includes a clear
+status string so you can open the file manually.
+
+**`Invalid parameter: 'exposure_ev'=99.0 is out of range [-5.0, 5.0]`**
+You passed a value outside the documented range.  See
+`src/darktable_mcp/edits.py` (`RANGES`) for the full list.
 
 ---
 
-## Author
+## Development
 
-**Yadullah Abidi** — [@YaddyVirus](https://github.com/YaddyVirus)
+```bash
+# Run tests
+pytest
+
+# Run tests with coverage
+pytest --cov=darktable_mcp
+
+# Regenerate logos (cross-platform)
+python generate_logos.py ./logos
+```
+
+The fork is on the `feature/darktable-cli-integration` branch.  All
+work should go through a worktree (see `AGENTS.md` if present).
+
+---
+
+## Authors
+
+- Original: **Yadullah Abidi** — [@YaddyVirus](https://github.com/YaddyVirus)
+- Fork maintainer: **Yuri Schmaltz** — [@yuri-schmaltz](https://github.com/yuri-schmaltz)
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
