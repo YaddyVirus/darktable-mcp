@@ -18,18 +18,26 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
   fork delegates the actual pixel pipeline to darktable's modules via
   the `.xmp` sidecar instead of re-implementing them in Pillow.  The
   Pillow path is now strictly a fallback for raster images.
+- **Async everywhere it matters.** `export_image`, `get_image_preview`
+  and `apply_settings_to_folder` are async MCP tools — batched exports
+  of 50 RAWs no longer block the server.  The darktable-cli subprocess
+  is awaited via `asyncio.create_subprocess_exec`.
+- **Edit presets.** Ship a small library of "looks" (moody film,
+  golden hour, landscape pop, portrait soft) in `presets/`.  Add your
+  own by dropping JSON into the directory listed in
+  `DARKTABLE_MCP_PRESETS`.
 - **Strict parameter validation.** Every numeric input is checked
   against documented ranges before touching the sidecar.
 - **Cross-platform preview.** Works on Windows, macOS and Linux.
 - **Batch operations.** `apply_settings_to_folder` copies the same edit
-  recipe to every image in a directory.
+  recipe to every image in a directory, bounded by `max_concurrent`.
 - **Linear RAW histogram.** `get_raw_histogram` reads the sensor data
   before the tone curve so you can see true highlight clipping.
 - **CI.** Tests run on Linux / macOS / Windows × Python 3.10–3.12, plus
   `pyright` lint.  See `.github/workflows/test.yml`.
-- **Tests.** 48 unit tests covering state persistence, XMP emission,
-  processor behaviour, batch tools, and darktable-cli control flow
-  (mocked subprocess).
+- **Tests.** 71 unit tests covering state persistence, XMP emission,
+  processor behaviour, batch tools, presets, async control flow, and
+  darktable-cli mocks.
 
 ## Features
 
@@ -209,7 +217,10 @@ Claude will:
 | `get_histogram` | Tonal/clipping analysis on the rendered preview |
 | `get_raw_histogram` | Tonal analysis on linear sensor data (RAW only) |
 | `copy_settings` | Copy edits from one image to another |
-| `apply_settings_to_folder` | Batch-copy edits to every image in a folder |
+| `apply_settings_to_folder` | Batch-copy edits to every image in a folder (async, bounded concurrency) |
+| `list_presets` | List available edit presets (built-in + user) |
+| `apply_preset` | Apply a named preset to an image |
+| `get_preset` | Inspect a preset's full contents |
 
 ### Example prompts
 
@@ -288,10 +299,37 @@ pyright src/ tests/
 python generate_logos.py ./logos
 ```
 
-The fork is on the `feature/v0.3-batch-and-async` branch.  All work
+The fork is on the `feature/v0.4-async-presets` branch.  All work
 should go through a worktree — see `AGENTS.md` for conventions.  To
 sync with the upstream repo see `docs/UPSTREAM_SYNC.md` and the
 `scripts/sync-upstream.sh` helper.
+
+## Custom presets
+
+Drop a JSON file into any directory listed in the `DARKTABLE_MCP_PRESETS`
+env var (colon-separated on POSIX, semicolon on Windows) and it will
+appear in `list_presets`.  Schema:
+
+```json
+{
+  "description": "A custom look",
+  "adjustments": {
+    "exposure_ev": 0.2,
+    "contrast": 15,
+    "saturation": -10,
+    "temperature_kelvin": 6200
+  },
+  "crop": { "left": 0.05, "top": 0.05, "right": 0.95, "bottom": 0.95 },
+  "output_name": "edited_{stem}"
+}
+```
+
+`{stem}`, `{name}` and `{ext}` are substituted in `output_name`; any
+character outside `[A-Za-z0-9._-]` is replaced with `_`.  Only fields
+present in the preset override the image; everything else is kept.
+
+Built-in presets (`presets/*.json`) are loaded as a fallback — the env
+var dir is searched first, then the package's `presets/`.
 
 ---
 

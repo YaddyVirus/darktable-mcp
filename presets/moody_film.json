@@ -1,0 +1,17 @@
+{
+    "description": "Dark, desaturated film look. Adds contrast and lift, slight green tint, deep vignette.",
+    "adjustments": {
+        "exposure_ev": -0.4,
+        "contrast": 30,
+        "highlights": -20,
+        "shadows": 15,
+        "whites": -10,
+        "blacks": -15,
+        "saturation": -25,
+        "vibrance": 10,
+        "clarity": 20,
+        "vignette": -35,
+        "temperature_kelvin": 5200,
+        "tint": -8
+    }
+}

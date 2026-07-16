@@ -7,6 +7,7 @@ handles raster images; for RAW without darktable we raise a clear error.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import shutil
 import subprocess
@@ -248,17 +249,38 @@ def _run_darktable_cli(
     bpp: int = 8,
     timeout: int = 300,
 ) -> dict:
-    """Invoke darktable-cli and return a result dict.
+    """Synchronous wrapper around :func:`_run_darktable_cli_async`."""
+    return asyncio.run(
+        _arun_darktable_cli(
+            src, xmp, dst,
+            width=width, height=height, quality=quality,
+            out_ext=out_ext, bpp=bpp, timeout=timeout,
+        )
+    )
+
+
+async def _arun_darktable_cli(
+    src: Path,
+    xmp: Optional[Path],
+    dst: Path,
+    *,
+    width: int = 0,
+    height: int = 0,
+    quality: int = 90,
+    out_ext: Optional[str] = None,
+    bpp: int = 8,
+    timeout: int = 300,
+) -> dict:
+    """Invoke ``darktable-cli`` asynchronously and return a result dict.
 
     Returns ``{"status": "ok", ...}`` on success or
-    ``{"status": "error", "reason": "..."}`` on failure.
+    ``{"status": "error", "reason": "..."}`` on failure.  The temp
+    ``--library`` directory is always cleaned up, even on error.
     """
     cli = find_darktable_cli()
     if cli is None:
         return {"status": "error", "reason": "darktable-cli not found on PATH"}
 
-    # darktable-cli requires a unique library per output to avoid races;
-    # point --library at a temp dir we delete afterwards.
     import tempfile
     libdir = Path(tempfile.mkdtemp(prefix="dtcli_"))
 
@@ -277,21 +299,39 @@ def _run_darktable_cli(
         cmd += ["--out-ext", out_ext]
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "reason": f"darktable-cli timed out after {timeout}s"}
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return {
+                "status": "error",
+                "reason": f"darktable-cli timed out after {timeout}s",
+            }
+        returncode = proc.returncode
+        stdout_s = stdout.decode("utf-8", errors="replace") if stdout else ""
+        stderr_s = stderr.decode("utf-8", errors="replace") if stderr else ""
+    except FileNotFoundError:
+        return {"status": "error", "reason": f"darktable-cli not executable: {cli}"}
     except Exception as exc:
         return {"status": "error", "reason": f"subprocess failed: {exc}"}
     finally:
         shutil.rmtree(libdir, ignore_errors=True)
 
-    if result.returncode != 0 or not dst.exists():
-        stderr = (result.stderr or result.stdout or "").strip()
+    if returncode != 0 or not dst.exists():
         return {
             "status": "error",
-            "reason": f"darktable-cli exited {result.returncode}: {stderr[:500]}",
+            "reason": f"darktable-cli exited {returncode}: "
+                      f"{(stderr_s or stdout_s).strip()[:500]}",
         }
 
     return {
@@ -321,12 +361,15 @@ class ImageProcessor:
         preview_size: Optional[int] = None,
         use_darktable_cli: bool = True,
     ) -> Image.Image:
-        """Render the image with all current edits applied.
+        """Render the image with all current edits applied (synchronous).
 
         Strategy:
           1. If darktable-cli is available and ``use_darktable_cli`` is True,
              render via darktable (correct RAW demosaicing + module chain).
-          2. Otherwise, fall back to rawpy + Pillow (raster only; RAW raises).
+          2. Otherwise, fall back to rawpy + Pillow for both RAW and raster.
+
+        For an async variant that doesn't block the MCP event loop on big
+        RAW files, use :meth:`process_async`.
         """
         if use_darktable_cli and find_darktable_cli() is not None:
             return self._process_via_darktable_cli(edit_state, preview_size)
@@ -344,6 +387,26 @@ class ImageProcessor:
             img.thumbnail((preview_size, preview_size), Image.Resampling.LANCZOS)
 
         return img
+
+    async def process_async(
+        self,
+        edit_state: EditState,
+        preview_size: Optional[int] = None,
+        use_darktable_cli: bool = True,
+    ) -> Image.Image:
+        """Async variant of :meth:`process` — uses ``await`` for the
+        darktable-cli subprocess so other MCP requests can be served while
+        a big RAW is rendering.
+        """
+        if use_darktable_cli and find_darktable_cli() is not None:
+            return await self._process_via_darktable_cli_async(
+                edit_state, preview_size
+            )
+        # Raster / rawpy fallbacks are CPU-bound but fast enough that the
+        # sync path is fine; running them inline keeps the code simple.
+        return self.process(
+            edit_state, preview_size=preview_size, use_darktable_cli=False
+        )
 
     def get_info(self) -> dict:
         info: dict = {
@@ -392,7 +455,20 @@ class ImageProcessor:
     def _process_via_darktable_cli(
         self, edit_state: EditState, preview_size: Optional[int]
     ) -> Image.Image:
-        """Render through darktable-cli and read the resulting JPEG/PNG."""
+        """Sync helper around :meth:`_process_via_darktable_cli_async`."""
+        return asyncio.run(
+            self._process_via_darktable_cli_async(edit_state, preview_size)
+        )
+
+    async def _process_via_darktable_cli_async(
+        self, edit_state: EditState, preview_size: Optional[int]
+    ) -> Image.Image:
+        """Render through darktable-cli asynchronously and read the result.
+
+        Writes the XMP sidecar (so darktable honours the edit state), then
+        awaits the darktable-cli subprocess with a per-call temp
+        ``--library`` directory.
+        """
         import tempfile
         from .xmp_writer import write_xmp
 
@@ -401,7 +477,7 @@ class ImageProcessor:
         # overwrite with the current state.
         try:
             xmp_path = write_xmp(edit_state)
-        except Exception as exc:
+        except Exception:
             # If XMP generation fails we still try to render with no XMP.
             xmp_path = None
 
@@ -410,7 +486,7 @@ class ImageProcessor:
             ext = "png" if preview_size and preview_size >= 4000 else "jpg"
             out_path = tmpdir / f"render.{ext}"
             width = height = int(preview_size) if preview_size else 0
-            res = _run_darktable_cli(
+            res = await _arun_darktable_cli(
                 self.path, xmp_path, out_path,
                 width=width, height=height, quality=90, out_ext=ext,
                 timeout=300,

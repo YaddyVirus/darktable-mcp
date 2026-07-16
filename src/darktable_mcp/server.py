@@ -1,6 +1,7 @@
 """Darktable MCP Server — photo editing tools for Claude."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -20,6 +21,7 @@ from dataclasses import asdict
 from mcp.server.fastmcp import FastMCP, Image
 
 from .edits import CropState, EditState, ValidationError, validate_param
+from .presets import apply_preset as _apply_preset, list_preset_names, load_preset
 from .processor import (
     ALL_EXTENSIONS,
     IMG_EXTENSIONS,
@@ -80,6 +82,14 @@ def _save_sidecar(state: EditState) -> Path:
 def _quick_preview(path: Path, state: EditState, max_size: int) -> tuple[Image.Image, bytes]:
     proc = ImageProcessor(path)
     img = proc.process(state, preview_size=max_size)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    return img, buf.getvalue()
+
+
+async def _quick_preview_async(path: Path, state: EditState, max_size: int) -> tuple[Image.Image, bytes]:
+    proc = ImageProcessor(path)
+    img = await proc.process_async(state, preview_size=max_size)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)
     return img, buf.getvalue()
@@ -159,7 +169,7 @@ def get_image_info(image_path: str) -> dict:
 
 @mcp.tool()
 @handle_path_errors
-def get_image_preview(image_path: str, max_size: int = 1200) -> list:
+async def get_image_preview(image_path: str, max_size: int = 1200) -> list:
     """Render the image with all current edits applied, save a preview file, and open it.
 
     Saves a __preview.jpg next to the source and opens it in the system image
@@ -170,7 +180,7 @@ def get_image_preview(image_path: str, max_size: int = 1200) -> list:
     *max_size* controls the longest edge of the preview in pixels (default 1200).
     """
     path, state = _load_or_new(image_path)
-    _img, img_bytes = _quick_preview(path, state, max_size)
+    _img, img_bytes = await _quick_preview_async(path, state, max_size)
     preview_path, open_status = _save_and_open_preview(path, img_bytes)
 
     open_msg = (
@@ -442,7 +452,7 @@ def reset_edits(image_path: str) -> dict:
 
 @mcp.tool()
 @handle_path_errors
-def export_image(
+async def export_image(
     image_path: str,
     output_directory: Optional[str] = None,
     format: str = "jpeg",
@@ -499,7 +509,9 @@ def export_image(
 
     # Try darktable-cli when available AND we have an XMP for it to use
     if use_darktable_cli and find_darktable_cli() is not None:
-        result = _export_via_darktable_cli(path, out_path, xmp_path, format, quality, max_dimension)
+        result = await _export_via_darktable_cli(
+            path, out_path, xmp_path, format, quality, max_dimension
+        )
         if result.get("status") == "ok":
             result["xmp_sidecar"] = str(xmp_path) if xmp_path else None
             return result
@@ -518,7 +530,7 @@ def export_image(
         }
 
     proc = ImageProcessor(path)
-    img = proc.process(state, use_darktable_cli=False)
+    img = await proc.process_async(state, use_darktable_cli=False)
 
     if max_dimension:
         from PIL import Image as PILImage
@@ -544,7 +556,7 @@ def export_image(
     }
 
 
-def _export_via_darktable_cli(
+async def _export_via_darktable_cli(
     src: Path,
     dst: Path,
     xmp: Optional[Path],
@@ -552,51 +564,83 @@ def _export_via_darktable_cli(
     quality: int,
     max_dimension: Optional[int],
 ) -> dict:
-    """Run darktable-cli to render *src* (+ optional *xmp*) to *dst*."""
-    cli = find_darktable_cli()
-    if cli is None:
-        return {"status": "error", "reason": "darktable-cli not found on PATH"}
+    """Run darktable-cli asynchronously to render *src* (+ optional *xmp*) to *dst*."""
+    from .processor import _arun_darktable_cli
 
     width = height = int(max_dimension) if max_dimension else 0
     ext_map = {"jpeg": "jpg", "jpg": "jpg", "png": "png", "tiff": "tif", "tif": "tif"}
     out_ext = ext_map.get(format.lower(), "jpg")
 
-    import tempfile
-    libdir = Path(tempfile.mkdtemp(prefix="dtexp_"))
-    try:
-        cmd = [cli, str(src)]
-        if xmp is not None and xmp.exists():
-            cmd.append(str(xmp))
-        cmd.append(str(dst))
-        cmd += [
-            "--width", str(width),
-            "--height", str(height),
-            "--quality", str(int(quality)),
-            "--bpp", "8",
-            "--library", str(libdir),
-        ]
-        if out_ext:
-            cmd += ["--out-ext", out_ext]
+    return await _arun_darktable_cli(
+        src, xmp, dst,
+        width=width, height=height, quality=quality, out_ext=out_ext,
+        bpp=8, timeout=300,
+    )
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and dst.exists():
-            return {
-                "status": "ok",
-                "output_path": str(dst),
-                "rendered_via": "darktable-cli",
-                "size_bytes": dst.stat().st_size,
-            }
-        return {
-            "status": "error",
-            "reason": f"darktable-cli exited {result.returncode}: "
-                      f"{(result.stderr or result.stdout or '').strip()[:500]}",
-        }
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "reason": "darktable-cli timed out after 300s"}
-    except Exception as exc:
-        return {"status": "error", "reason": f"subprocess failed: {exc}"}
-    finally:
-        shutil.rmtree(libdir, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Preset tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_presets() -> list[dict]:
+    """List all available edit presets.
+
+    Presets are JSON files in the package's ``presets/`` directory and
+    any directory listed in the ``DARKTABLE_MCP_PRESETS`` env var
+    (colon-separated on POSIX, semicolon on Windows).
+
+    Each entry has ``name``, ``path``, and ``source`` (``"builtin"`` or
+    ``"user"``).
+    """
+    return list_preset_names()
+
+
+@mcp.tool()
+@handle_path_errors
+def apply_preset(image_path: str, preset_name: str) -> dict:
+    """Apply a named preset to *image_path*.
+
+    Only the fields present in the preset are changed; everything else
+    keeps its current value.  Use ``get_image_preview`` to verify the
+    result.
+
+    The preset's ``output_name`` template (if any) is applied to the
+    image's sidecar so a subsequent ``export_image`` writes to the
+    preset's filename pattern.
+    """
+    path, state = _load_or_new(image_path)
+    try:
+        preset = load_preset(preset_name)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": f"Invalid preset: {exc}"}
+
+    _apply_preset(preset, state)
+    _save_sidecar(state)
+
+    return {
+        "status": "ok",
+        "preset": preset_name,
+        "applied_adjustments": list((preset.get("adjustments") or {}).keys()),
+        "applied_crop": preset.get("crop") is not None,
+        "output_name": state.output_name,
+        "edits": state.to_dict(),
+    }
+
+
+@mcp.tool()
+@handle_path_errors
+def get_preset(preset_name: str) -> dict:
+    """Return the full contents of a preset (for inspection / debugging)."""
+    try:
+        data = load_preset(preset_name)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": f"Invalid preset: {exc}"}
+    return {"status": "ok", "preset": preset_name, "data": data}
 
 
 @mcp.tool()
@@ -761,12 +805,13 @@ def copy_settings(source_image_path: str, target_image_path: str) -> dict:
 
 @mcp.tool()
 @handle_path_errors
-def apply_settings_to_folder(
+async def apply_settings_to_folder(
     source_image_path: str,
     target_directory: str,
     file_pattern: str = "*",
     recursive: bool = False,
     skip_existing_edits: bool = False,
+    max_concurrent: int = 4,
 ) -> dict:
     """Batch-apply edit settings (adjustments + crop) from *source_image_path*
     to every supported image in *target_directory*.
@@ -784,6 +829,9 @@ def apply_settings_to_folder(
         If True, walk subdirectories too.
     skip_existing_edits : bool
         If True, skip files that already have a non-empty sidecar.
+    max_concurrent : int
+        Maximum number of sidecar writes in flight at once.  Defaults to 4
+        — the writes are I/O bound so more than 8 rarely helps.
 
     Returns
     -------
@@ -813,32 +861,44 @@ def apply_settings_to_folder(
     else:
         candidates = list(dir_path.glob(file_pattern))
 
-    copied: list[str] = []
-    skipped: list[str] = []
-    failed: list[dict] = []
-
+    targets: list[Path] = []
+    skipped_self: list[str] = []
     for file in sorted(candidates):
         if not file.is_file():
             continue
         if file.suffix.lower() not in ALL_EXTENSIONS:
             continue
         if file.resolve() == src_path.resolve():
-            skipped.append(str(file))   # don't copy onto self
+            skipped_self.append(str(file))
             continue
+        targets.append(file)
 
-        try:
-            existing = EditState.load(file)
-            if skip_existing_edits and existing and existing.has_changes():
-                skipped.append(str(file))
-                continue
-            tgt = existing or EditState(source_path=file)
-            tgt.adjustments = replace(src_state.adjustments)
-            tgt.crop = replace(src_state.crop) if src_state.crop else None
-            _save_sidecar(tgt)
-            copied.append(str(file))
-        except Exception as exc:
-            logger.exception("Failed to copy settings to %s", file)
-            failed.append({"file": str(file), "error": str(exc)})
+    semaphore = asyncio.Semaphore(max(1, max_concurrent))
+
+    async def _copy_one(file: Path) -> tuple[str, str, Optional[str]]:
+        """Return (file, status, error).  status in {"copied", "skipped", "failed"}."""
+        async with semaphore:
+            try:
+                existing = EditState.load(file)
+                if skip_existing_edits and existing and existing.has_changes():
+                    return (str(file), "skipped", None)
+                tgt = existing or EditState(source_path=file)
+                tgt.adjustments = replace(src_state.adjustments)
+                tgt.crop = replace(src_state.crop) if src_state.crop else None
+                # Run the blocking sidecar write in a thread so the event
+                # loop isn't blocked under heavy concurrency.
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _save_sidecar, tgt)
+                return (str(file), "copied", None)
+            except Exception as exc:
+                logger.exception("Failed to copy settings to %s", file)
+                return (str(file), "failed", str(exc))
+
+    results = await asyncio.gather(*[_copy_one(t) for t in targets])
+
+    copied = [f for f, s, _ in results if s == "copied"]
+    skipped = [f for f, s, _ in results if s == "skipped"] + skipped_self
+    failed = [{"file": f, "error": e} for f, s, e in results if s == "failed"]
 
     return {
         "status": "ok" if not failed else "partial",

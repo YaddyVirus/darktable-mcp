@@ -1,0 +1,15 @@
+{
+    "description": "Warm sunset / golden hour look. Pushes temperature warm, lifts shadows, soft vignette.",
+    "adjustments": {
+        "exposure_ev": 0.1,
+        "contrast": 15,
+        "highlights": -15,
+        "shadows": 25,
+        "saturation": 15,
+        "vibrance": 20,
+        "temperature_kelvin": 6800,
+        "tint": 5,
+        "vignette": -20,
+        "clarity": 10
+    }
+}

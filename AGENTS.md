@@ -34,13 +34,16 @@ pyright src/ tests/
 src/darktable_mcp/
   edits.py        # state dataclasses + JSON sidecar persistence
   processor.py    # image rendering (delegates to darktable-cli)
+  presets.py      # named edit presets (JSON files)
   xmp_writer.py   # Darktable-compatible XMP sidecar generator
   server.py       # MCP tools (the FastMCP surface)
+presets/          # built-in edit presets
 tests/            # pytest suite, mirrors the module layout
 .github/
   workflows/      # CI (matrix: 3 OS × 3 Python × lint)
   dependabot.yml
-.claude/          # project-specific Claude config (if any)
+docs/             # project docs (UPSTREAM_SYNC.md, …)
+scripts/          # helper scripts (sync-upstream.sh, …)
 ```
 
 ## Coding conventions
@@ -51,6 +54,10 @@ tests/            # pytest suite, mirrors the module layout
   that introduce type errors will fail.
 - **Pillow API:** use `Image.Resampling.LANCZOS` etc. — the bare
   `LANCZOS` / `BICUBIC` constants are deprecated.
+- **Async where it matters.**  Tools that wrap an external subprocess
+  (`export_image`, `get_image_preview`, `apply_settings_to_folder`)
+  MUST be declared `async def` so the event loop isn't blocked.
+  Tests for these tools use `pytest-asyncio` (`pytestmark = pytest.mark.asyncio`).
 - **No silent failures.**  If a tool can't do its job, return
   `{"error": "..."}` or raise.  Never swallow exceptions in
   bare `except Exception: pass`.

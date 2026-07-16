@@ -1,0 +1,17 @@
+{
+    "description": "Flattering portrait look. Slight warm tone, lifted shadows, soft contrast, reduced clarity for smooth skin.",
+    "adjustments": {
+        "exposure_ev": 0.3,
+        "contrast": -10,
+        "highlights": -30,
+        "shadows": 30,
+        "whites": 5,
+        "blacks": 10,
+        "saturation": -5,
+        "vibrance": 10,
+        "clarity": -15,
+        "sharpness": 10,
+        "temperature_kelvin": 5300,
+        "tint": 5
+    }
+}

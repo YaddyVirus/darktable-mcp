@@ -41,7 +41,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run pytest
-        run: pytest -v --tb=short
+        run: pytest -v --tb=short --color=yes
 
   lint:
     name: pyright (ubuntu-latest / py${{ matrix.python-version }})

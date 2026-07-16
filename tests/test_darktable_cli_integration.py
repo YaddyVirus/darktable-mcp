@@ -1,25 +1,34 @@
 """Integration tests for the darktable-cli code paths.
 
-We mock ``subprocess.run`` and the ``find_darktable_cli`` discovery so the
-test exercises the full control flow (XMP writing, command construction,
-output path handling, library-dir cleanup) without requiring a real
-darktable install in CI.
+We mock the async subprocess invocation (``asyncio.create_subprocess_exec``)
+and ``find_darktable_cli`` discovery so the tests exercise the full
+control flow (XMP writing, command construction, output path handling,
+library-dir cleanup) without requiring a real darktable install in CI.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from PIL import Image
 
 from darktable_mcp import edits, server
 from darktable_mcp.processor import (
+    _arun_darktable_cli,
     _run_darktable_cli,
     find_darktable_cli,
 )
+
+
+def _call_async(coro_or_value):
+    """Run an async tool from a sync test."""
+    if asyncio.iscoroutine(coro_or_value):
+        return asyncio.run(coro_or_value)
+    return coro_or_value
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +118,13 @@ def test_run_darktable_cli_writes_output(tmp_path: Path, patched_darktable):
 def test_run_darktable_cli_passes_xmp(tmp_path: Path, fake_darktable, monkeypatch):
     captured: dict = {}
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
         # Pretend success by writing the dst file ourselves
         SKIP = {'--width', '--height', '--quality', '--bpp',
                 '--library', '--out-ext', '--core', '--configdir'}
         positionals = []
-        i = 1
+        i = 0
         while i < len(cmd):
             a = cmd[i]
             if a in SKIP:
@@ -127,17 +136,16 @@ def test_run_darktable_cli_passes_xmp(tmp_path: Path, fake_darktable, monkeypatc
             positionals.append(a)
             i += 1
         dst = Path(positionals[-1])
-        result = MagicMock()
-        result.returncode = 0
-        result.stdout = ""
-        result.stderr = ""
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(b"x")
-        return result
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
 
     monkeypatch.setattr("darktable_mcp.processor.find_darktable_cli",
                         lambda: str(fake_darktable))
-    monkeypatch.setattr("darktable_mcp.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
     src = tmp_path / "a.NEF"
     src.write_bytes(b"x")
@@ -167,14 +175,13 @@ def test_run_darktable_cli_cleans_library_dir(tmp_path: Path, fake_darktable, mo
     """The temp --library dir must be removed after the call, success or fail."""
     captured_libdirs: list[Path] = []
 
-    def fake_run(cmd, **kwargs):
-        # Snapshot library dir while still alive
-        libdir = Path(cmd[cmd.index("--library") + 1])
+    async def fake_exec(*cmd, **kwargs):
+        libdir = Path(cmd[list(cmd).index("--library") + 1])
         captured_libdirs.append(libdir)
         SKIP = {'--width', '--height', '--quality', '--bpp',
                 '--library', '--out-ext', '--core', '--configdir'}
         positionals = []
-        i = 1
+        i = 0
         while i < len(cmd):
             a = cmd[i]
             if a in SKIP:
@@ -186,17 +193,16 @@ def test_run_darktable_cli_cleans_library_dir(tmp_path: Path, fake_darktable, mo
             positionals.append(a)
             i += 1
         dst = Path(positionals[-1])
-        result = MagicMock()
-        result.returncode = 0
-        result.stdout = ""
-        result.stderr = ""
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(b"x")
-        return result
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
 
     monkeypatch.setattr("darktable_mcp.processor.find_darktable_cli",
                         lambda: str(fake_darktable))
-    monkeypatch.setattr("darktable_mcp.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
     src = tmp_path / "a.NEF"
     src.write_bytes(b"x")
@@ -213,16 +219,15 @@ def test_run_darktable_cli_cleans_library_dir(tmp_path: Path, fake_darktable, mo
 def test_run_darktable_cli_returns_error_on_nonzero_exit(
     tmp_path: Path, fake_darktable, monkeypatch
 ):
-    def fake_run(cmd, **kwargs):
-        result = MagicMock()
-        result.returncode = 1
-        result.stdout = ""
-        result.stderr = "module 'foo' not found"
-        return result
+    async def fake_exec(*cmd, **kwargs):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b"module 'foo' not found"))
+        proc.returncode = 1
+        return proc
 
     monkeypatch.setattr("darktable_mcp.processor.find_darktable_cli",
                         lambda: str(fake_darktable))
-    monkeypatch.setattr("darktable_mcp.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
     res = _run_darktable_cli(tmp_path / "a.NEF", None, tmp_path / "out.jpg")
     assert res["status"] == "error"
@@ -232,12 +237,15 @@ def test_run_darktable_cli_returns_error_on_nonzero_exit(
 def test_run_darktable_cli_handles_timeout(
     tmp_path: Path, fake_darktable, monkeypatch
 ):
-    def fake_run(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
+    async def fake_exec(*cmd, **kwargs):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        proc.kill = MagicMock()
+        return proc
 
     monkeypatch.setattr("darktable_mcp.processor.find_darktable_cli",
                         lambda: str(fake_darktable))
-    monkeypatch.setattr("darktable_mcp.processor.subprocess.run", fake_run)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
     res = _run_darktable_cli(tmp_path / "a.NEF", None, tmp_path / "out.jpg",
                               timeout=10)
@@ -294,7 +302,7 @@ def test_process_falls_back_when_darktable_cli_unavailable(
 def test_export_image_uses_darktable_cli_when_available(
     tmp_path: Path, sample_image_with_edits, patched_darktable
 ):
-    r = server.export_image(str(sample_image_with_edits), format="jpeg", quality=90)
+    r = _call_async(server.export_image(str(sample_image_with_edits), format="jpeg", quality=90))
     assert r["status"] == "ok", r
     assert r["rendered_via"] == "darktable-cli"
     assert Path(r["output_path"]).exists()
@@ -314,7 +322,7 @@ def test_export_image_falls_back_to_pillow_for_raster(
     Image.new("RGB", (100, 100), (200, 100, 50)).save(src)
     server.apply_adjustments(str(src), exposure_ev=0.3)
 
-    r = server.export_image(str(src), format="jpeg", quality=85)
+    r = _call_async(server.export_image(str(src), format="jpeg", quality=85))
     assert r["status"] == "ok", r
     assert r["rendered_via"] == "rawpy+pillow"
     assert Path(r["output_path"]).exists()
@@ -336,6 +344,6 @@ def test_export_raw_without_darktable_or_rawpy_raises_clear_error(
 
     src = tmp_path / "IMG.CR2"
     src.write_bytes(b"x")
-    r = server.export_image(str(src))
+    r = _call_async(server.export_image(str(src)))
     assert r["status"] == "error"
     assert "darktable-cli" in r["reason"] or "rawpy" in r["reason"]

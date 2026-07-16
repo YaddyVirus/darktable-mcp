@@ -1,0 +1,17 @@
+{
+    "description": "Vivid landscape look. Boosts saturation and clarity, neutral white balance, mild contrast.",
+    "adjustments": {
+        "exposure_ev": 0.2,
+        "contrast": 20,
+        "highlights": -25,
+        "shadows": 20,
+        "whites": 10,
+        "blacks": -10,
+        "saturation": 25,
+        "vibrance": 30,
+        "clarity": 30,
+        "sharpness": 25,
+        "vignette": -15,
+        "temperature_kelvin": 5500
+    }
+}
