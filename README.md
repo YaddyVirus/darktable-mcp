@@ -35,7 +35,7 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
   before the tone curve so you can see true highlight clipping.
 - **CI.** Tests run on Linux / macOS / Windows × Python 3.10–3.12, plus
   `pyright` lint.  See `.github/workflows/test.yml`.
-- **Tests.** 100 unit tests covering state persistence, XMP emission,
+- **Tests.** 107 unit tests covering state persistence, XMP emission,
   processor behaviour, batch tools, presets, async control flow,
   HSL grading, tone curve, undo/redo, and darktable-cli mocks.
 - **HSL color grading** (v0.5).  Eight colour families (red, orange,
@@ -51,6 +51,13 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - **Before / after compare** (v0.5).  `compare_before_after` renders
   the original and the edited image side-by-side into
   `<stem>__compare.jpg` and returns it, so Claude can verify edits.
+- **XMP round-trip for HSL + curve** (v0.5.1).  HSL grading and the
+  parametric tone curve are now also emitted into the `.xmp` sidecar
+  as darktable `colorbalancergb` (modversion 5) and `levels`
+  (modversion 2) modules, so opening the RAW in darktable shows the
+  intent of the grading.  Per-band precision is necessarily lossy —
+  the Pillow pipeline is still pixel-accurate; the XMP is a best-
+  effort approximation.
 
 ## Features
 
@@ -66,7 +73,7 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - 💾 **Non-destructive** — all edits stored in a sidecar JSON; originals never touched
 - 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars darktable can read
 - 📋 **Batch copy settings** — apply one image's edits to many others
-- 🧪 **Tested** — 100 unit tests in `tests/`, plus `pyright` lint in CI
+- 🧪 **Tested** — 107 unit tests in `tests/`, plus `pyright` lint in CI
 
 ---
 
