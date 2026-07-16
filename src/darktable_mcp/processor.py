@@ -341,7 +341,7 @@ class ImageProcessor:
             img = self._apply_crop(img, edit_state.crop)
 
         if preview_size:
-            img.thumbnail((preview_size, preview_size), Image.LANCZOS)
+            img.thumbnail((preview_size, preview_size), Image.Resampling.LANCZOS)
 
         return img
 
@@ -515,7 +515,7 @@ class ImageProcessor:
 
         # Apply rotation first (expand so no content is lost, then re-crop)
         if abs(crop.rotation) > 0.01:
-            img = img.rotate(-crop.rotation, expand=True, resample=Image.BICUBIC)
+            img = img.rotate(-crop.rotation, expand=True, resample=Image.Resampling.BICUBIC)
             w, h = img.size
 
         left = int(crop.left * w)

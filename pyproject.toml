@@ -24,6 +24,8 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pyright>=1.1.350",
+    "rawpy>=0.18.0",
 ]
 raw = [
     # rawpy is the fallback RAW decoder; required only if you want to render

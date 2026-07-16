@@ -522,7 +522,7 @@ def export_image(
 
     if max_dimension:
         from PIL import Image as PILImage
-        img.thumbnail((max_dimension, max_dimension), PILImage.LANCZOS)
+        img.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
 
     save_kwargs: dict = {}
     if format.lower() in ("jpeg", "jpg"):
@@ -652,6 +652,96 @@ def get_histogram(image_path: str, bins: int = 64) -> dict:
 
 @mcp.tool()
 @handle_path_errors
+def get_raw_histogram(image_path: str, bins: int = 64) -> dict:
+    """Compute a histogram of the *linear* sensor data, before any tone curve.
+
+    Only meaningful for RAW files (sensor data in 16-bit linear space).
+    For JPEG/PNG the result is the same as ``get_histogram`` since the
+    input is already display-referred.
+
+    Useful to:
+      - detect true sensor clipping (highlights that the tone curve would
+        otherwise "rescue" in a render),
+      - read the actual dynamic range of the captured scene,
+      - decide whether the exposure needs a real pull-down vs. just a
+        tone-curve adjustment.
+
+    Returns per-channel (R, G, B) and luminance histograms as *bins*-bin
+    arrays, plus min/max/median values so you can quickly judge the
+    actual exposure headroom.
+    """
+    import numpy as np
+
+    if bins < 8 or bins > 1024:
+        return {"error": "bins must be between 8 and 1024"}
+
+    path, _state = _load_or_new(image_path)
+
+    if path.suffix.lower() not in RAW_EXTENSIONS:
+        return {
+            "status": "ok",
+            "note": f"{path.suffix!r} is not a RAW file; returned display-referred histogram.",
+            "rendered": True,
+        } | get_histogram(image_path, bins=bins)
+
+    try:
+        import rawpy
+    except ImportError:
+        return {"error": "rawpy is not installed; cannot read RAW linear data."}
+
+    with rawpy.imread(str(path)) as raw:
+        rgb = raw.postprocess(
+            use_camera_wb=True,
+            output_bps=16,
+            no_auto_bright=True,
+            bright=1.0,
+            output_color=rawpy.ColorSpace.sRGB,
+        )
+
+    arr = np.asarray(rgb, dtype=np.uint16)
+    # Per-channel histogram in 16-bit space
+    def _hist16(channel: np.ndarray) -> list[int]:
+        counts, _ = np.histogram(channel.ravel(), bins=bins, range=(0, 65536))
+        return counts.tolist()
+
+    r_hist = _hist16(arr[..., 0])
+    g_hist = _hist16(arr[..., 1])
+    b_hist = _hist16(arr[..., 2])
+    lum16 = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ).astype(np.uint32)
+    lum_hist, _ = np.histogram(lum16.ravel(), bins=bins, range=(0, 65536))
+
+    # 14-bit is the typical sensor ceiling (highlight clip in linear space)
+    sensor_ceiling = 16383  # 2^14 - 1
+    near_clip = int((lum16 >= sensor_ceiling * 0.99).sum())
+    near_black = int((lum16 <= 1).sum())
+    total = int(lum16.size)
+
+    return {
+        "status": "ok",
+        "rendered": False,  # linear sensor data
+        "bins": bins,
+        "bit_depth": 16,
+        "r": r_hist,
+        "g": g_hist,
+        "b": b_hist,
+        "luminance": lum_hist.tolist(),
+        "min_luminance": int(lum16.min()),
+        "max_luminance": int(lum16.max()),
+        "median_luminance": float(np.median(lum16)),
+        "near_highlight_clip_px": near_clip,
+        "near_shadow_floor_px": near_black,
+        "near_highlight_clip_pct": round(near_clip / total * 100, 4),
+        "near_shadow_floor_pct": round(near_black / total * 100, 4),
+        "total_pixels": total,
+        "sensor_bit_depth": 14,
+        "sensor_ceiling": sensor_ceiling,
+    }
+
+
+@mcp.tool()
+@handle_path_errors
 def copy_settings(source_image_path: str, target_image_path: str) -> dict:
     """Copy all edit settings (adjustments + crop) from one image to another.
 
@@ -667,3 +757,96 @@ def copy_settings(source_image_path: str, target_image_path: str) -> dict:
     _save_sidecar(tgt_state)
 
     return {"status": "ok", "copied_to": str(tgt_path), "edits": tgt_state.to_dict()}
+
+
+@mcp.tool()
+@handle_path_errors
+def apply_settings_to_folder(
+    source_image_path: str,
+    target_directory: str,
+    file_pattern: str = "*",
+    recursive: bool = False,
+    skip_existing_edits: bool = False,
+) -> dict:
+    """Batch-apply edit settings (adjustments + crop) from *source_image_path*
+    to every supported image in *target_directory*.
+
+    Parameters
+    ----------
+    source_image_path : str
+        Path to the image whose edit state should be copied.
+    target_directory : str
+        Folder containing target images.
+    file_pattern : str
+        Glob pattern (e.g. ``"*.NEF"``, ``"IMG_*.CR2"``).  Default ``"*"`` matches
+        every supported image.
+    recursive : bool
+        If True, walk subdirectories too.
+    skip_existing_edits : bool
+        If True, skip files that already have a non-empty sidecar.
+
+    Returns
+    -------
+    dict
+        Summary: ``{"status": "ok", "copied": N, "skipped": M, "failed": K,
+        "details": [...]}``.
+    """
+    from dataclasses import replace
+
+    src_path, src_state = _load_or_new(source_image_path)
+    src_has_changes = src_state.has_changes()
+    if not src_has_changes:
+        return {
+            "status": "error",
+            "reason": (
+                f"Source {src_path} has no edits to apply "
+                "(apply some adjustments first)."
+            ),
+        }
+
+    dir_path = Path(target_directory)
+    if not dir_path.is_dir():
+        return {"error": f"Directory not found: {target_directory}"}
+
+    if recursive:
+        candidates = list(dir_path.rglob(file_pattern))
+    else:
+        candidates = list(dir_path.glob(file_pattern))
+
+    copied: list[str] = []
+    skipped: list[str] = []
+    failed: list[dict] = []
+
+    for file in sorted(candidates):
+        if not file.is_file():
+            continue
+        if file.suffix.lower() not in ALL_EXTENSIONS:
+            continue
+        if file.resolve() == src_path.resolve():
+            skipped.append(str(file))   # don't copy onto self
+            continue
+
+        try:
+            existing = EditState.load(file)
+            if skip_existing_edits and existing and existing.has_changes():
+                skipped.append(str(file))
+                continue
+            tgt = existing or EditState(source_path=file)
+            tgt.adjustments = replace(src_state.adjustments)
+            tgt.crop = replace(src_state.crop) if src_state.crop else None
+            _save_sidecar(tgt)
+            copied.append(str(file))
+        except Exception as exc:
+            logger.exception("Failed to copy settings to %s", file)
+            failed.append({"file": str(file), "error": str(exc)})
+
+    return {
+        "status": "ok" if not failed else "partial",
+        "source": str(src_path),
+        "copied_count": len(copied),
+        "skipped_count": len(skipped),
+        "failed_count": len(failed),
+        "copied": copied,
+        "skipped": skipped,
+        "failed": failed,
+    }

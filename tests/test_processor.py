@@ -9,6 +9,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -60,27 +61,27 @@ def solid_image() -> Image.Image:
 
 def test_vignette_below_threshold_is_unchanged(solid_image):
     out = _apply_vignette(solid_image, 0.5)
-    assert list(out.getdata()) == list(solid_image.getdata())
+    np.testing.assert_array_equal(np.array(out), np.array(solid_image))
 
 
 def test_vignette_darkens_corners_more_than_centre(solid_image):
     out = _apply_vignette(solid_image, -50)
-    arr = out
+    arr = np.array(out)
     # Sample a 5x5 patch at the corner and at the centre
-    corner = arr.crop((0, 0, 5, 5)).resize((1, 1)).getpixel((0, 0))[0]
-    centre = arr.crop((97, 97, 102, 102)).resize((1, 1)).getpixel((0, 0))[0]
+    corner = float(arr[0:5, 0:5].mean())
+    centre = float(arr[97:102, 97:102].mean())
     assert centre > corner, f"centre {centre} should be brighter than corner {corner}"
 
 
 def test_clarity_below_threshold_is_unchanged(solid_image):
     out = _apply_clarity(solid_image, 0.5)
     # Solid colour → no visible change
-    assert list(out.getdata())[:10] == list(solid_image.getdata())[:10]
+    np.testing.assert_array_equal(np.array(out), np.array(solid_image))
 
 
 def test_noise_reduction_below_threshold_is_unchanged(solid_image):
     out = _apply_noise_reduction(solid_image, 0.5)
-    assert list(out.getdata()) == list(solid_image.getdata())
+    np.testing.assert_array_equal(np.array(out), np.array(solid_image))
 
 
 def test_noise_reduction_smoothing_preserves_dimensions(solid_image):
@@ -91,8 +92,8 @@ def test_noise_reduction_smoothing_preserves_dimensions(solid_image):
 def test_vibrance_does_not_change_grayscale(solid_image):
     # Solid grey → vibrance should not move the colour
     out = _apply_vibrance(solid_image, 50)
-    px = out.getpixel((100, 100))
-    assert all(abs(c - 128) <= 2 for c in px), px
+    px = np.array(out)[100, 100]
+    assert all(abs(int(c) - 128) <= 2 for c in px), px
 
 
 # ---------------------------------------------------------------------------

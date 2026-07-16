@@ -16,13 +16,20 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - **Real darktable rendering.** When `darktable-cli` is installed (and the
   official darktable is recommended for accurate RAW demosaicing), this
   fork delegates the actual pixel pipeline to darktable's modules via
-  the `.xmp` sidecar instead of re-implementing them in Pillow. The
+  the `.xmp` sidecar instead of re-implementing them in Pillow.  The
   Pillow path is now strictly a fallback for raster images.
 - **Strict parameter validation.** Every numeric input is checked
   against documented ranges before touching the sidecar.
 - **Cross-platform preview.** Works on Windows, macOS and Linux.
-- **Tests.** 29 unit tests covering state persistence, XMP emission, and
-  processor behaviour.
+- **Batch operations.** `apply_settings_to_folder` copies the same edit
+  recipe to every image in a directory.
+- **Linear RAW histogram.** `get_raw_histogram` reads the sensor data
+  before the tone curve so you can see true highlight clipping.
+- **CI.** Tests run on Linux / macOS / Windows × Python 3.10–3.12, plus
+  `pyright` lint.  See `.github/workflows/test.yml`.
+- **Tests.** 48 unit tests covering state persistence, XMP emission,
+  processor behaviour, batch tools, and darktable-cli control flow
+  (mocked subprocess).
 
 ## Features
 
@@ -34,7 +41,7 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
 - 💾 **Non-destructive** — all edits stored in a sidecar JSON; originals never touched
 - 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars darktable can read
 - 📋 **Batch copy settings** — apply one image's edits to many others
-- 🧪 **Tested** — 29 unit tests in `tests/`
+- 🧪 **Tested** — 48 unit tests in `tests/`, plus `pyright` lint in CI
 
 ---
 
@@ -197,10 +204,12 @@ Claude will:
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
 | `rename_output` | Set the export filename |
-| `export_image` | Export to JPEG / PNG / TIFF |
+| `export_image` | Export to JPEG / PNG / TIFF (via darktable-cli when available) |
 | `reset_edits` | Undo everything, back to original (also cleans up `.xmp`) |
-| `get_histogram` | Tonal/clipping analysis (configurable bin count) |
+| `get_histogram` | Tonal/clipping analysis on the rendered preview |
+| `get_raw_histogram` | Tonal analysis on linear sensor data (RAW only) |
 | `copy_settings` | Copy edits from one image to another |
+| `apply_settings_to_folder` | Batch-copy edits to every image in a folder |
 
 ### Example prompts
 
@@ -272,12 +281,17 @@ pytest
 # Run tests with coverage
 pytest --cov=darktable_mcp
 
+# Type check
+pyright src/ tests/
+
 # Regenerate logos (cross-platform)
 python generate_logos.py ./logos
 ```
 
-The fork is on the `feature/darktable-cli-integration` branch.  All
-work should go through a worktree (see `AGENTS.md` if present).
+The fork is on the `feature/v0.3-batch-and-async` branch.  All work
+should go through a worktree — see `AGENTS.md` for conventions.  To
+sync with the upstream repo see `docs/UPSTREAM_SYNC.md` and the
+`scripts/sync-upstream.sh` helper.
 
 ---
 

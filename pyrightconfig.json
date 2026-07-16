@@ -1,0 +1,9 @@
+{
+    "include": ["src", "tests"],
+    "exclude": ["**/__pycache__", ".venv", "build", "dist"],
+    "pythonVersion": "3.10",
+    "typeCheckingMode": "basic",
+    "reportMissingImports": "none",
+    "reportMissingTypeStubs": "none",
+    "useLibraryCodeForTypes": true
+}
