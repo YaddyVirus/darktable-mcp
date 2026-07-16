@@ -30,6 +30,36 @@ RANGES: dict[str, tuple[float, float]] = {
     "noise_reduction":     (  0.0, 100.0),
     "vignette":            (-100.0, 100.0),
     "clarity":             (-100.0, 100.0),
+    # Parametric tone curve
+    "curve_shadows":       (-100.0, 100.0),
+    "curve_darks":         (-100.0, 100.0),
+    "curve_lights":        (-100.0, 100.0),
+    "curve_highlights":    (-100.0, 100.0),
+    # HSL color grading (8 colors × 3 axes)
+    "hue_red":             (-100.0, 100.0),
+    "hue_orange":          (-100.0, 100.0),
+    "hue_yellow":          (-100.0, 100.0),
+    "hue_green":           (-100.0, 100.0),
+    "hue_aqua":            (-100.0, 100.0),
+    "hue_blue":            (-100.0, 100.0),
+    "hue_purple":          (-100.0, 100.0),
+    "hue_magenta":         (-100.0, 100.0),
+    "sat_red":             (-100.0, 100.0),
+    "sat_orange":          (-100.0, 100.0),
+    "sat_yellow":          (-100.0, 100.0),
+    "sat_green":           (-100.0, 100.0),
+    "sat_aqua":            (-100.0, 100.0),
+    "sat_blue":            (-100.0, 100.0),
+    "sat_purple":          (-100.0, 100.0),
+    "sat_magenta":         (-100.0, 100.0),
+    "lum_red":             (-100.0, 100.0),
+    "lum_orange":          (-100.0, 100.0),
+    "lum_yellow":          (-100.0, 100.0),
+    "lum_green":           (-100.0, 100.0),
+    "lum_aqua":            (-100.0, 100.0),
+    "lum_blue":            (-100.0, 100.0),
+    "lum_purple":          (-100.0, 100.0),
+    "lum_magenta":         (-100.0, 100.0),
 }
 
 
@@ -81,9 +111,44 @@ class AdjustmentState:
     whites: float = 0.0       # -100 to +100
     blacks: float = 0.0       # -100 to +100
 
+    # --- Parametric tone curve (additive on top of the tone block) ---
+    curve_shadows: float = 0.0     # -100 to +100 (lift / crush blacks)
+    curve_darks: float = 0.0       # -100 to +100 (lower midtones)
+    curve_lights: float = 0.0      # -100 to +100 (raise midtones)
+    curve_highlights: float = 0.0  # -100 to +100 (pull highlights)
+
     # --- Colour ---
     saturation: float = 0.0   # -100 to +100
     vibrance: float = 0.0     # -100 to +100
+
+    # --- HSL color grading (8 colour families × 3 axes) ---
+    # Hue: shift the colour around the wheel (-100..+100 → ±30°)
+    # Sat: boost or cut saturation within the colour band
+    # Lum: brighten or darken within the colour band
+    hue_red: float = 0.0
+    hue_orange: float = 0.0
+    hue_yellow: float = 0.0
+    hue_green: float = 0.0
+    hue_aqua: float = 0.0
+    hue_blue: float = 0.0
+    hue_purple: float = 0.0
+    hue_magenta: float = 0.0
+    sat_red: float = 0.0
+    sat_orange: float = 0.0
+    sat_yellow: float = 0.0
+    sat_green: float = 0.0
+    sat_aqua: float = 0.0
+    sat_blue: float = 0.0
+    sat_purple: float = 0.0
+    sat_magenta: float = 0.0
+    lum_red: float = 0.0
+    lum_orange: float = 0.0
+    lum_yellow: float = 0.0
+    lum_green: float = 0.0
+    lum_aqua: float = 0.0
+    lum_blue: float = 0.0
+    lum_purple: float = 0.0
+    lum_magenta: float = 0.0
 
     # --- Detail ---
     sharpness: float = 0.0      # 0 to 100
@@ -155,6 +220,9 @@ class EditState:
     def has_changes(self) -> bool:
         defaults = AdjustmentState()
         a = self.adjustments
+        # The new fields (curve_*, hue_*, sat_*, lum_*) live on the
+        # dataclass too; a simple dataclass comparison covers all of
+        # them without having to enumerate.
         return any([
             a.exposure_ev != defaults.exposure_ev,
             a.contrast != defaults.contrast,
@@ -163,6 +231,14 @@ class EditState:
             a.sharpness != defaults.sharpness,
             a.noise_reduction != defaults.noise_reduction,
             a.vignette != defaults.vignette,
+            a.clarity != defaults.clarity,
+            a.curve_shadows != defaults.curve_shadows,
+            a.curve_darks != defaults.curve_darks,
+            a.curve_lights != defaults.curve_lights,
+            a.curve_highlights != defaults.curve_highlights,
+            a.hue_red != defaults.hue_red,
+            a.sat_red != defaults.sat_red,
+            a.lum_red != defaults.lum_red,
             self.crop is not None,
             self.output_name is not None,
         ])
@@ -181,3 +257,63 @@ class EditState:
         if xmp.exists():
             paths.append(xmp)
         return paths
+
+    # ------------------------------------------------------------------
+    # Undo / redo via history sidecars
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _history_dir(image_path: Path) -> Path:
+        return image_path.with_name(image_path.stem + ".mcp.history")
+
+    def save_with_history(self, *, keep: int = 20) -> Path:
+        """Persist *self* and snapshot the previous sidecar into history.
+
+        The current sidecar is moved to ``<stem>.mcp.history/<UTC>.json``;
+        the next call to :meth:`EditState.load` will return the new state.
+        The history directory is FIFO-trimmed to *keep* entries so it
+        doesn't grow unbounded.
+        """
+        current = self._sidecar(self.source_path)
+        hist_dir = self._history_dir(self.source_path)
+        hist_dir.mkdir(parents=True, exist_ok=True)
+
+        if current.exists():
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+            snapshot = hist_dir / f"{stamp}.json"
+            # If the same microsecond collides, bump.
+            n = 1
+            while snapshot.exists():
+                snapshot = hist_dir / f"{stamp}_{n}.json"
+                n += 1
+            snapshot.write_bytes(current.read_bytes())
+            # FIFO-trim
+            entries = sorted(hist_dir.glob("*.json"), key=lambda p: p.name)
+            for old in entries[:-keep]:
+                old.unlink()
+
+        return self.save()
+
+    def list_history(self) -> list[Path]:
+        """Return the history sidecars in chronological order (oldest first)."""
+        hist_dir = self._history_dir(self.source_path)
+        if not hist_dir.is_dir():
+            return []
+        return sorted(hist_dir.glob("*.json"), key=lambda p: p.name)
+
+    def restore_history_entry(self, entry: Path, *, snapshot: bool = True) -> Path:
+        """Replace the current sidecar with *entry*.
+
+        When *snapshot* is True (default), the current sidecar is
+        committed to history first — useful for "save current and
+        restore" flows.  When *snapshot* is False (e.g. for undo), the
+        current sidecar is overwritten in place with no history push.
+        """
+        if not entry.exists():
+            raise FileNotFoundError(f"History entry not found: {entry}")
+        if snapshot:
+            self.save_with_history()
+        current = self._sidecar(self.source_path)
+        current.write_bytes(entry.read_bytes())
+        return current

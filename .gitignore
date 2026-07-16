@@ -6,3 +6,8 @@ build/
 .venv/
 *.mcp.json
 *.xmp
+# Per-image edit history (v0.5+); local undo/redo data, not for VCS
+*.mcp.history/
+# Before/after compare previews (v0.5+)
+*__compare.jpg
+*__preview.jpg

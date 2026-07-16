@@ -234,6 +234,163 @@ def _apply_noise_reduction(img: Image.Image, strength: float) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Parametric tone curve
+# ---------------------------------------------------------------------------
+
+def _build_tone_curve_lut(
+    shadows: float,
+    darks: float,
+    lights: float,
+    highlights: float,
+) -> np.ndarray:
+    """Build a 256-entry tone-curve LUT from 4 control points.
+
+    Control-point positions (in normalised luminance):
+        shadows    at 0.00   — affects the deep blacks
+        darks      at 0.25   — lower midtones
+        lights     at 0.75   — upper midtones
+        highlights at 1.00   — near-whites
+
+    Each control point shifts the curve by *value/100* (clamped to ±1.0
+    so we don't go negative).  The output is a smooth piecewise-linear
+    curve interpolated at every 1/255 input.
+    """
+    # Anchor positions on the [0, 255] LUT axis.
+    xs = np.array([0.0, 63.75, 191.25, 255.0])
+    ys = np.array([shadows, darks, lights, highlights]) / 100.0
+    # Convert into output offset at each anchor; clamp so the curve
+    # can never invert.
+    ys = np.clip(ys, -1.0, 1.0)
+    # Map the offset into a target luminance value: out = in + offset
+    # (clamped to [0, 1]).  Then renormalise the four anchor points so
+    # the overall slope doesn't collapse to zero.
+    target = np.clip(xs / 255.0 + ys, 0.0, 1.0)
+    # np.interp requires the x-axis to be sorted.
+    out = np.interp(np.arange(256, dtype=np.float32), xs, target * 255.0)
+    return out.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# HSL colour grading
+# ---------------------------------------------------------------------------
+
+# 8 colour bands defined by hue centre + half-width (in degrees, 0-360).
+# Wraps around the wheel (red is split into 0-15 and 345-360).
+_HSL_BANDS: list[tuple[str, float, float]] = [
+    ("red",     0.0,   20.0),
+    ("orange",  30.0,  15.0),
+    ("yellow",  60.0,  20.0),
+    ("green",  110.0,  40.0),
+    ("aqua",   170.0,  20.0),
+    ("blue",   225.0,  30.0),
+    ("purple", 270.0,  20.0),
+    ("magenta",310.0,  25.0),
+]
+
+
+def _hue_distance(h: np.ndarray, centre: float) -> np.ndarray:
+    """Circular hue distance (in degrees, 0-180) on the 0-360 wheel."""
+    d = np.abs(h - centre)
+    return np.minimum(d, 360.0 - d)
+
+
+def _band_weights(h: np.ndarray) -> np.ndarray:
+    """Return (8, h, w) array of soft weights summing to 1 along axis 0."""
+    weights = np.zeros((len(_HSL_BANDS), h.shape[0], h.shape[1]),
+                       dtype=np.float32)
+    for i, (_name, centre, half_w) in enumerate(_HSL_BANDS):
+        d = _hue_distance(h, centre)
+        # Triangular falloff: 1.0 at centre, 0.0 at half_w.
+        weights[i] = np.clip(1.0 - d / half_w, 0.0, 1.0)
+    total = weights.sum(axis=0)
+    total = np.where(total > 0, total, 1.0)
+    return weights / total
+
+
+def _rgb_to_hsl(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised RGB uint8 (H, W, 3) -> (H, W) H, S, L in [0,360]/[0,1]/[0,1]."""
+    r, g, b = arr[..., 0].astype(np.float32) / 255.0, \
+              arr[..., 1].astype(np.float32) / 255.0, \
+              arr[..., 2].astype(np.float32) / 255.0
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    light = (mx + mn) / 2.0
+    sat = np.zeros_like(light)
+    delta = mx - mn
+    nonzero = delta > 1e-6
+    sat[nonzero] = np.where(
+        light[nonzero] <= 0.5,
+        delta[nonzero] / (mx[nonzero] + mn[nonzero] + 1e-6),
+        delta[nonzero] / (2.0 - mx[nonzero] - mn[nonzero] + 1e-6),
+    )
+    hue = np.zeros_like(light)
+    rmax = (mx == r) & nonzero
+    gmax = (mx == g) & nonzero
+    bmax = (mx == b) & nonzero
+    hue[rmax] = ((g[rmax] - b[rmax]) / (delta[rmax] + 1e-6)) % 6.0
+    hue[gmax] = ((b[gmax] - r[gmax]) / (delta[gmax] + 1e-6)) + 2.0
+    hue[bmax] = ((r[bmax] - g[bmax]) / (delta[bmax] + 1e-6)) + 4.0
+    hue = hue * 60.0  # 0..360
+    return hue, sat, light
+
+
+def _hsl_to_rgb(h: np.ndarray, s: np.ndarray, light: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_rgb_to_hsl`.  Returns uint8 (H, W, 3)."""
+    h = h % 360.0
+    c = (1.0 - np.abs(2.0 * light - 1.0)) * s
+    x = c * (1.0 - np.abs((h / 60.0) % 2.0 - 1.0))
+    m = light - c / 2.0
+    sector = (h / 60.0).astype(np.int32) % 6
+    rgb = np.zeros(light.shape + (3,), dtype=np.float32)
+    # Per-sector (R, G, B) intermediate values.  We assemble these as
+    # full-size arrays so pyright can see r, g, b as np.ndarray instead
+    # of the for-loop tuple scalars.
+    rs = [c,   x,   np.zeros_like(c), np.zeros_like(c), x,   c]
+    gs = [x,   c,   c,              x,              np.zeros_like(c), np.zeros_like(c)]
+    bs = [np.zeros_like(c), np.zeros_like(c), x,   c,   c,   x]
+    for i in range(6):
+        mask = sector == i
+        rgb[..., 0] = np.where(mask, rs[i], rgb[..., 0])
+        rgb[..., 1] = np.where(mask, gs[i], rgb[..., 1])
+        rgb[..., 2] = np.where(mask, bs[i], rgb[..., 2])
+    rgb += m[..., None]
+    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+
+def _apply_hsl_grading(arr: np.ndarray, adj: AdjustmentState) -> np.ndarray:
+    """Apply HSL hue/sat/lum shifts per band to a uint8 (H, W, 3) image."""
+    # Build per-band (hue_shift_deg, sat_add, lum_add) by reading the
+    # fields off the AdjustmentState.
+    band_params: list[tuple[float, float, float]] = []
+    for name, _centre, _hw in _HSL_BANDS:
+        hue_v = getattr(adj, f"hue_{name}")
+        sat_v = getattr(adj, f"sat_{name}")
+        lum_v = getattr(adj, f"lum_{name}")
+        # hue -100..+100 -> -30..+30 degrees
+        band_params.append((hue_v * 0.3, sat_v / 100.0, lum_v / 100.0))
+
+    if all(h == 0.0 and s == 0.0 and l == 0.0 for h, s, l in band_params):
+        return arr  # nothing to do
+
+    h, s, l = _rgb_to_hsl(arr)
+    weights = _band_weights(h)  # (8, H, W)
+
+    # Per-pixel hue shift (weighted by band weights)
+    hue_shift = np.zeros_like(h)
+    sat_shift = np.zeros_like(s)
+    lum_shift = np.zeros_like(l)
+    for (h_shift_deg, s_add, l_add), w in zip(band_params, weights):
+        hue_shift += w * h_shift_deg
+        sat_shift += w * s_add
+        lum_shift += w * l_add
+
+    new_h = (h + hue_shift) % 360.0
+    new_s = np.clip(s + sat_shift, 0.0, 1.0)
+    new_l = np.clip(l + lum_shift, 0.0, 1.0)
+    return _hsl_to_rgb(new_h, new_s, new_l)
+
+
+# ---------------------------------------------------------------------------
 # darktable-cli integration
 # ---------------------------------------------------------------------------
 
@@ -566,6 +723,26 @@ class ImageProcessor:
         # Vibrance
         if adj.vibrance != 0.0:
             img = _apply_vibrance(img, adj.vibrance)
+
+        # HSL colour grading (8 colour families × 3 axes)
+        if any([
+            getattr(adj, f"hue_{n}") or getattr(adj, f"sat_{n}") or getattr(adj, f"lum_{n}")
+            for n, _, _ in _HSL_BANDS
+        ]):
+            arr = np.array(img, dtype=np.uint8)
+            arr = _apply_hsl_grading(arr, adj)
+            img = Image.fromarray(arr)
+
+        # Parametric tone curve (4 control points).  Applied AFTER the
+        # coarse highlight/shadow/whites/blacks block so the curve is
+        # the final word on tone shape.
+        if any([adj.curve_shadows, adj.curve_darks,
+                adj.curve_lights, adj.curve_highlights]):
+            lut = _build_tone_curve_lut(
+                adj.curve_shadows, adj.curve_darks,
+                adj.curve_lights, adj.curve_highlights,
+            )
+            img = _apply_lut(img, lut)
 
         # Clarity
         if adj.clarity != 0.0:

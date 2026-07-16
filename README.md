@@ -35,21 +35,38 @@ Tell Claude what you want — *"make this warmer and more dramatic"*, *"crop to 
   before the tone curve so you can see true highlight clipping.
 - **CI.** Tests run on Linux / macOS / Windows × Python 3.10–3.12, plus
   `pyright` lint.  See `.github/workflows/test.yml`.
-- **Tests.** 71 unit tests covering state persistence, XMP emission,
-  processor behaviour, batch tools, presets, async control flow, and
-  darktable-cli mocks.
+- **Tests.** 100 unit tests covering state persistence, XMP emission,
+  processor behaviour, batch tools, presets, async control flow,
+  HSL grading, tone curve, undo/redo, and darktable-cli mocks.
+- **HSL color grading** (v0.5).  Eight colour families (red, orange,
+  yellow, green, aqua, blue, purple, magenta) × three axes (hue,
+  saturation, luminance) for 24 independent grading sliders.
+- **Parametric tone curve** (v0.5).  Four control points (shadows,
+  darks, lights, highlights) shaping a smooth piecewise-linear curve
+  on the luminance channel.
+- **Undo / redo** (v0.5).  Each `apply_adjustments` / `crop_image` /
+  `reset_edits` call snapshots the prior sidecar into
+  `<stem>.mcp.history/`, so `undo_last_edit(steps=N)` rolls back N
+  edits.  Reset itself is undoable.
+- **Before / after compare** (v0.5).  `compare_before_after` renders
+  the original and the edited image side-by-side into
+  `<stem>__compare.jpg` and returns it, so Claude can verify edits.
 
 ## Features
 
 - 🖼️ **RAW file support** — CR2, NEF, ARW, RAF, DNG, ORF, RW2, and more
 - 🎨 **Full editing toolkit** — exposure, white balance, contrast, highlights/shadows, saturation, vibrance, clarity, sharpness, noise reduction, vignette
+- 🌈 **HSL color grading** — 8 colour families × 3 axes (hue/sat/lum) for fine-grained control
+- 📈 **Parametric tone curve** — shadows, darks, lights, highlights; smooth piecewise-linear curve
+- ↩️ **Undo / redo** — every edit is recorded; roll back the last N edits any time
+- 👀 **Before/after compare** — render original and edited side-by-side, returned to Claude
 - ✂️ **Crop & rotate** — free crop, aspect ratio crop (16:9, 4:3, 1:1…), straighten
 - 📝 **Rename outputs** — give your exports meaningful names
 - 📊 **Histogram analysis** — Claude checks clipping and tonal distribution before suggesting edits
 - 💾 **Non-destructive** — all edits stored in a sidecar JSON; originals never touched
 - 🔄 **Darktable XMP export** — edits written as `.xmp` sidecars darktable can read
 - 📋 **Batch copy settings** — apply one image's edits to many others
-- 🧪 **Tested** — 48 unit tests in `tests/`, plus `pyright` lint in CI
+- 🧪 **Tested** — 100 unit tests in `tests/`, plus `pyright` lint in CI
 
 ---
 
@@ -207,13 +224,16 @@ Claude will:
 | `list_images` | List all images in a directory |
 | `get_image_info` | EXIF metadata + current edit state + `darktable_cli` availability |
 | `get_image_preview` | Render and preview with edits applied |
-| `apply_adjustments` | Exposure, WB, tone, colour, detail, effects (validated) |
+| `apply_adjustments` | Exposure, WB, tone, curve, HSL grading, colour, detail, effects (validated) |
 | `crop_image` | Crop by coordinates or aspect ratio |
 | `rotate_image` | Rotate / straighten |
 | `reset_crop` | Remove crop, restore full frame |
 | `rename_output` | Set the export filename |
 | `export_image` | Export to JPEG / PNG / TIFF (via darktable-cli when available) |
 | `reset_edits` | Undo everything, back to original (also cleans up `.xmp`) |
+| `list_edit_history` | List previous edit states saved in `<stem>.mcp.history/` |
+| `undo_last_edit` | Roll back the last N edits (default 1) |
+| `compare_before_after` | Render original vs. edited side-by-side, return the stitched image |
 | `get_histogram` | Tonal/clipping analysis on the rendered preview |
 | `get_raw_histogram` | Tonal analysis on linear sensor data (RAW only) |
 | `copy_settings` | Copy edits from one image to another |
@@ -247,6 +267,20 @@ modules instead of a Pillow approximation.
 
 `reset_edits` removes both the `.mcp.json` and any `.xmp` sidecar that
 was created, so the directory is left clean.
+
+### Undo / redo (v0.5)
+
+Before each `apply_adjustments` / `crop_image` / `reset_edits` call,
+the **previous** sidecar is copied into a sibling directory named
+`<stem>.mcp.history/` with a UTC timestamped filename
+(`20260716T181230_123456.json`).  The directory keeps at most the last
+20 entries (FIFO).  `undo_last_edit(steps=N)` pops the latest
+snapshot back over the current sidecar; `undo_last_edit` itself does
+NOT push a new history entry, so you don't need to undo your undos.
+
+The history directory is local to the worktree and is excluded by
+`.gitignore`.  To wipe all history for an image, delete
+`<stem>.mcp.history/` manually.
 
 ---
 
