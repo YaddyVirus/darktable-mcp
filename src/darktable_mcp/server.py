@@ -5,6 +5,7 @@ import io
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -45,10 +46,17 @@ def _quick_preview(path: Path, state: EditState, max_size: int) -> Image:
     return img, buf.getvalue()
 
 
+PREVIEW_DIR = Path(tempfile.gettempdir()) / "darktable-mcp-previews"
+
+
 def _save_and_open_preview(path: Path, img_bytes: bytes) -> str:
-    """Save preview to disk next to the source file and open it."""
-    import os
-    preview_path = path.with_name(path.stem + "__preview.jpg")
+    """Save preview to a temp folder (never next to the source) and open it.
+
+    Writing previews into the photo folder pollutes it and gets picked up by
+    globs such as ``*.jpg`` when the originals are batch-processed later.
+    """
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    preview_path = PREVIEW_DIR / f"{path.stem}__preview.jpg"
     preview_path.write_bytes(img_bytes)
     try:
         import os
@@ -107,7 +115,8 @@ def get_image_info(image_path: str) -> dict:
 def get_image_preview(image_path: str, max_size: int = 1200) -> list:
     """Render the image with all current edits applied, save a preview file, and open it.
 
-    Saves a __preview.jpg next to the source and opens it in the Windows image
+    Saves a __preview.jpg in the OS temp folder (darktable-mcp-previews) — never
+    next to the source — and opens it in the Windows image
     viewer so the user can see it immediately.  Also returns the image so Claude
     can analyse it and suggest further improvements.
     *max_size* controls the longest edge of the preview in pixels (default 1200).

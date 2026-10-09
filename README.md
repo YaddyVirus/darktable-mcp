@@ -51,6 +51,7 @@ This installs all dependencies automatically:
 - `Pillow` — image processing
 - `numpy` — array operations
 - `piexif` — EXIF metadata
+- `exifread` — reading camera EXIF from RAW files
 
 ### 3. Verify it works
 
@@ -125,7 +126,7 @@ Claude will:
 1. Call `list_images` to see your folder
 2. Call `get_image_preview` to analyse the photo
 3. Call `apply_adjustments` with specific values
-4. Show you a preview (saved as `filename__preview.jpg` next to the source)
+4. Show you a preview (saved as `filename__preview.jpg` in your temp folder, under `darktable-mcp-previews`)
 5. Iterate based on your feedback
 6. Export the final image when you're happy
 
@@ -177,7 +178,7 @@ Use the full path to your Python executable in the config. Run `where python` (W
 Some camera models need an updated version of `rawpy`. Run `pip install --upgrade rawpy`.
 
 **Preview file not opening**  
-The preview is always saved as `originalname__preview.jpg` next to your source file. Open it manually if your system doesn't pop it up automatically.
+The preview is always saved as `originalname__preview.jpg` in `%TEMP%\darktable-mcp-previews` (never next to your source file). Open it manually if your system doesn't pop it up automatically.
 
 ---
 

@@ -34,6 +34,54 @@ def _kelvin_to_rgb_shift(temp_k: float, tint: float = 0.0) -> tuple[float, float
 
 
 # ---------------------------------------------------------------------------
+# EXIF helpers
+# ---------------------------------------------------------------------------
+
+def _ratio_to_float(value) -> float:
+    return float(value.num) / float(value.den) if hasattr(value, "den") else float(value)
+
+
+def _format_shutter(seconds: float) -> str:
+    if seconds >= 1 or seconds <= 0:
+        return f"{seconds:.1f}s".replace(".0s", "s")
+    return f"1/{round(1 / seconds)}s"
+
+
+def _read_exif(path: Path) -> dict:
+    """Read camera EXIF from any RAW (TIFF-based) or raster file via exifread.
+
+    Some cameras (e.g. Google Pixel DNGs) store the shooting tags in IFD0
+    ("Image ...") instead of the EXIF sub-IFD ("EXIF ..."), so both are checked.
+    """
+    import exifread
+
+    with open(path, "rb") as f:
+        tags = exifread.process_file(f, details=False)
+
+    def first(name: str):
+        tag = tags.get(f"EXIF {name}") or tags.get(f"Image {name}")
+        return tag.values[0] if tag and isinstance(tag.values, list) and tag.values else (tag.values if tag else None)
+
+    info: dict = {}
+    make, model = first("Make"), first("Model")
+    if make or model:
+        info["camera"] = " ".join(str(s).strip() for s in (make, model) if s)
+    if (v := first("ISOSpeedRatings")) is not None:
+        info["iso"] = int(v)
+    if (v := first("ExposureTime")) is not None:
+        seconds = _ratio_to_float(v)
+        info["shutter"] = round(seconds, 6)
+        info["shutter_display"] = _format_shutter(seconds)
+    if (v := first("FNumber")) is not None:
+        info["aperture"] = round(_ratio_to_float(v), 2)
+    if (v := first("FocalLength")) is not None:
+        info["focal_len"] = round(_ratio_to_float(v), 2)
+    if (v := first("DateTimeOriginal") or first("DateTime")) is not None:
+        info["timestamp"] = str(v)
+    return info
+
+
+# ---------------------------------------------------------------------------
 # Tone-curve helpers
 # ---------------------------------------------------------------------------
 
@@ -204,30 +252,18 @@ class ImageProcessor:
                 with rawpy.imread(str(self.path)) as raw:
                     info["width"] = raw.sizes.width
                     info["height"] = raw.sizes.height
-                    info["camera"] = raw.metadata.camera
-                    info["iso"] = raw.metadata.iso
-                    info["shutter"] = raw.metadata.shutter
-                    info["aperture"] = raw.metadata.aperture
-                    info["focal_len"] = raw.metadata.focal_len
-                    info["timestamp"] = raw.metadata.timestamp
                     info["raw_type"] = raw.raw_type.name
             else:
                 with Image.open(self.path) as img:
                     info["width"] = img.width
                     info["height"] = img.height
                     info["mode"] = img.mode
-                    exif = img.getexif() if hasattr(img, "getexif") else {}
-                    if exif:
-                        # Common EXIF tag IDs
-                        TAG_MAP = {
-                            271: "make", 272: "model", 283: "focal_length",
-                            34855: "iso", 33434: "shutter", 33437: "aperture",
-                        }
-                        for tag_id, name in TAG_MAP.items():
-                            if tag_id in exif:
-                                info[name] = exif[tag_id]
         except Exception as exc:
             info["read_error"] = str(exc)
+        try:
+            info.update(_read_exif(self.path))
+        except Exception as exc:
+            info["exif_error"] = str(exc)
         return info
 
     # ------------------------------------------------------------------
