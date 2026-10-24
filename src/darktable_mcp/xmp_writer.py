@@ -1,18 +1,7 @@
-"""Write Darktable-compatible XMP sidecar files from an EditState.
+"""Write darktable 5.x XMP sidecars (``IMG_x.CR3.xmp``) from an EditState.
 
-Darktable stores per-module history items in its XMP sidecars.  Each item's
-``darktable:params`` field is a little-endian hex-encoded binary blob whose
-layout matches the module's C struct (version-dependent).
-
-We implement only the modules whose struct layout is well-known and stable:
-  - exposure   (modversion 6)
-  - temperature (modversion 5, simplified to camera-WB coefficients)
-  - brightness_contrast (modversion 1)
-  - colorbalance saturation via ``colorin`` is complex – we skip it
-  - crop/rotate via ``crop`` module (modversion 5)
-
-Unknown adjustments are silently skipped in the XMP; they are still applied
-when exporting via rawpy/Pillow.
+Param blobs are little-endian C structs whose layouts were decoded from real
+darktable 5.6.1 sidecars and confirmed by rendering with darktable-cli.
 """
 from __future__ import annotations
 
@@ -20,256 +9,98 @@ import struct
 from pathlib import Path
 from typing import Optional
 
-from .edits import EditState, AdjustmentState, CropState
+from .edits import EditState
 
-# ---------------------------------------------------------------------------
-# Blendop default (7 bytes + padding, version 7)
-# Values from a vanilla Darktable export with no blending.
-# ---------------------------------------------------------------------------
-_BLENDOP_DEFAULT = (
-    "00000000"  # mask_mode = DEVELOP_MASK_DISABLED (0)
-    "00000000"  # blend_mode = DEVELOP_BLEND_NORMAL (0)
-    "000000000000000000000000"  # opacity = 1.0 → we encode as float below
-    "00000000"  # mask_id = 0
-    "07000000"  # blendop_version = 7
-    "00000000" * 16  # feathering / details padding
+_BLENDOP = "gz11eJxjYIAACQYYOOHEgAZY0QWAgBGLGANDgz0Ej1Q+dcF/IADRAGpyHQU="
+_BLENDOP_EXPOSURE = "gz08eJxjYGBgYAFiCQYYOOHEgAZY0QWAgBGLGANDgz0Ej1Q+dlAx68oBEMbFxwX+AwGIBgCbGCeh"
+# Same multi_name as darktable's auto-applied instance, so ours replaces it instead of stacking.
+_SCENE_DEFAULT = "_builtin_scene-referred default"
+_DT_DEFAULT_EXPOSURE = 0.7
+
+_FILMIC_FLOATS = [18.45, -7.4833, 4.8267, 0, 3, 100, 100, 0, 0, 18.45, 0.0152, 100, 3.3956, 0.01, 1.0, 0, 0, 0.2]
+_FILMIC_INTS = [3, 4, 1, 0, 1, 1, 0, 0, 0, 2, 0]
+
+# Blob of darktable's built-in preset "_builtin_wavelets: chroma only" (denoiseprofile v12).
+_DENOISE_CHROMA = (
+    "0000803f0000e0409a99993f000000000000000000000000cdcccc3d0000803f000080bf"
+    "00000000000000000000000000000000000000000100000000000000"
+    + "abaa2a3eabaaaa3e0000003fabaa2a3f5655553f0000803f00000000" * 5
+    + "abaa2a3eabaaaa3e0000003fabaa2a3f5655553f0000803f"
+    + "0000003f" * 28 + "00000000" * 7 + "0000003f" * 7
+    + "01000000" * 4 + "00000000"
 )
 
-# Simpler constant pulled from real darktable output
-_BLENDOP_V7 = (
-    "0c000000"  # mask_mode DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL
-    "0c000000"  # DEVELOP_BLEND_NORMAL8
-    + "0000803f"  # opacity 1.0 (float LE)
-    + "00000000"  # mask_id
-    + "00000000" * 30  # padding to 140 bytes
-)
-
-# Use a safe minimal blendop blob that darktable accepts
-def _blendop() -> str:
-    # 140-byte blendop_params_v7: just set opacity=1.0, rest zeros
-    buf = bytearray(140)
-    # mask_mode = 0 (DEVELOP_MASK_DISABLED)
-    struct.pack_into("<I", buf, 0, 0)
-    # blend_mode = 12 (DEVELOP_BLEND_NORMAL_UNBOUNDED in older DT; 0 = passthrough)
-    struct.pack_into("<I", buf, 4, 0)
-    # opacity = 1.0
-    struct.pack_into("<f", buf, 8, 1.0)
-    return buf.hex()
-
-
-# ---------------------------------------------------------------------------
-# Module param encoders
-# ---------------------------------------------------------------------------
-
-def _encode_exposure(exposure_ev: float, black: float = 0.0) -> str:
-    """exposure module version 6.
-
-    struct dt_iop_exposure_params_t {
-        dt_iop_exposure_mode_t mode;  // int32, 0=MANUAL
-        float black;
-        float exposure;
-        float deflicker_percentile;
-        float deflicker_target_level;
-    }
-    """
-    data = struct.pack("<iffff", 0, black, exposure_ev, 50.0, -4.0)
-    return data.hex()
-
-
-def _encode_temperature(temp_k: float, tint: float = 0.0) -> str:
-    """temperature module version 5 (simplified).
-
-    We write coefficients for a basic Planckian-locus approximation.
-    struct dt_iop_temperature_params_t {
-        float temp_out;       // colour temperature (informational)
-        float coeffs[4][2];   // wb multipliers per illuminant
-        gboolean adapt_3way;  // 4 bytes
-        float g_mix;
-    }  ≈ 4 + 32 + 4 + 4 = 44 bytes
-    """
-    ref_k = 5500.0
-    ratio = temp_k / ref_k
-    r = (1.0 / ratio) ** 1.2
-    g = 1.0 + (tint / 100.0) * 0.15
-    b = ratio ** 1.2
-    mn = min(r, g, b)
-    r, g, b = r / mn, g / mn, b / mn
-
-    buf = bytearray(44)
-    struct.pack_into("<f", buf, 0, temp_k)
-    # coeffs[4][2] — we fill illuminant 0 (D65) only
-    struct.pack_into("<ff", buf, 4, r, g)
-    struct.pack_into("<ff", buf, 12, b, g)
-    # adapt_3way = 0
-    struct.pack_into("<I", buf, 36, 0)
-    # g_mix = 0.5
-    struct.pack_into("<f", buf, 40, 0.5)
-    return buf.hex()
-
-
-def _encode_brightness_contrast(brightness: float, contrast: float) -> str:
-    """brightness_contrast module version 1.
-
-    struct dt_iop_brightnesscontrast_params_t {
-        float brightness;  // -1.0..1.0
-        float contrast;    // -1.0..1.0
-    }
-    """
-    b = brightness / 100.0
-    c = contrast / 100.0
-    data = struct.pack("<ff", b, c)
-    return data.hex()
-
-
-def _encode_crop(crop: CropState) -> str:
-    """crop module version 5.
-
-    struct dt_iop_crop_params_t {
-        float cx, cy, cw, ch;   // normalised 0..1
-        float angle;             // degrees
-    }  = 5 floats = 20 bytes
-    """
-    data = struct.pack(
-        "<fffff",
-        crop.left,
-        crop.top,
-        crop.right,
-        crop.bottom,
-        -crop.rotation,  # darktable uses CCW convention
-    )
-    return data.hex()
-
-
-def _encode_sharpen(amount: float) -> str:
-    """sharpen module version 3.
-
-    struct dt_iop_sharpen_params_t {
-        float radius;
-        float amount;
-        float threshold;
-    }
-    """
-    radius = 1.5 + amount / 100.0 * 4.0
-    amt = amount / 100.0 * 0.5
-    data = struct.pack("<fff", radius, amt, 0.01)
-    return data.hex()
-
-
-def _encode_denoiseprofile(strength: float) -> str:
-    """denoise (profiled) module version 10 — very simplified.
-
-    We only set strength; the rest uses darktable defaults (zeros map to
-    no-op for most fields, and darktable will use the camera profile).
-    struct size ≈ 32 floats for v10.
-    """
-    buf = bytearray(128)
-    struct.pack_into("<f", buf, 0, strength / 100.0)
-    return buf.hex()
-
-
-def _encode_vignette(amount: float) -> str:
-    """vignette module version 5.
-
-    struct dt_iop_vignette_params_t {
-        float scale;       // 0..1, size of the unvignetted centre
-        float falloff_scale; // 0..1
-        float brightness; // -1..1 (negative = darker)
-        float saturation; // 0..1
-        dt_iop_vignette_shape_t shape; // int, 0=ELLIPSE
-        int   unbound;
-    }  = 4 floats + 2 ints = 24 bytes
-    """
-    sat = 0.8
-    brightness = -abs(amount) / 100.0 if amount < 0 else abs(amount) / 100.0
-    scale = 0.5
-    falloff = 0.5
-    data = struct.pack("<ffffii", scale, falloff, brightness, sat, 0, 0)
-    return data.hex()
-
-
-# ---------------------------------------------------------------------------
-# XMP builder
-# ---------------------------------------------------------------------------
-
-_XMP_TEMPLATE = """\
+_HEADER = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
-    xmlns:dc="http://purl.org/dc/elements/1.1/"
-    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
     xmlns:darktable="http://darktable.sf.net/"
-    darktable:xmp_version="4"
-    darktable:raw_params="0"
-    darktable:auto_presets_applied="1"
-    darktable:history_end="{history_end}">
+   xmpMM:DerivedFrom="{source}"
+   darktable:xmp_version="5"
+   darktable:raw_params="0"
+   darktable:auto_presets_applied="0"
+   darktable:history_end="{end}"
+   darktable:iop_order_version="4">
+   <darktable:masks_history>
+    <rdf:Seq/>
+   </darktable:masks_history>
    <darktable:history>
     <rdf:Seq>
-{history_items}    </rdf:Seq>
+{items}    </rdf:Seq>
    </darktable:history>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 """
 
-_HISTORY_ITEM = """\
+_ITEM = """\
      <rdf:li
-      darktable:operation="{operation}"
+      darktable:num="{num}"
+      darktable:operation="{op}"
       darktable:enabled="1"
-      darktable:modversion="{modversion}"
+      darktable:modversion="{ver}"
       darktable:params="{params}"
-      darktable:multi_name=""
+      darktable:multi_name="{name}"
+      darktable:multi_name_hand_edited="0"
       darktable:multi_priority="0"
-      darktable:blendop_version="7"
-      darktable:blendop_params="{blendop}"
-      />
+      darktable:blendop_version="14"
+      darktable:blendop_params="{blendop}"/>
 """
 
 
-def write_xmp(edit_state: EditState) -> Path:
-    """Write a Darktable XMP sidecar for *edit_state* and return its path."""
-    adj = edit_state.adjustments
-    blendop = _blendop()
-    items: list[str] = []
+def write_xmp(edit_state: EditState) -> Optional[Path]:
+    """Write the sidecar and return its path, or None if one already exists (it may hold the user's own edits)."""
+    src = edit_state.source_path
+    xmp_path = src.with_name(src.name + ".xmp")
+    if xmp_path.exists():
+        return None
 
-    def _item(op: str, ver: int, params: str) -> str:
-        return _HISTORY_ITEM.format(
-            operation=op, modversion=ver, params=params, blendop=blendop
-        )
-
-    # Exposure
-    if adj.exposure_ev != 0.0 or adj.black_level != 0.0:
-        items.append(_item("exposure", 6, _encode_exposure(adj.exposure_ev, adj.black_level)))
-
-    # White balance (temperature)
-    if adj.temperature_kelvin is not None:
-        items.append(_item("temperature", 5, _encode_temperature(adj.temperature_kelvin, adj.tint)))
-
-    # Brightness / contrast
-    if adj.brightness != 0.0 or adj.contrast != 0.0:
-        items.append(_item("brightness_contrast", 1, _encode_brightness_contrast(adj.brightness, adj.contrast)))
-
-    # Sharpening
+    adj, crop = edit_state.adjustments, edit_state.crop
+    mods: list[tuple[str, int, str, str, str]] = []
+    if adj.exposure_ev or adj.black_level:
+        # darktable's black slider spans ±0.1 and 0.01 already crushes shadows visibly, so scale the 0–0.5 range down
+        params = struct.pack("<i4f2i", 0, adj.black_level / 10,_DT_DEFAULT_EXPOSURE + adj.exposure_ev, 50, -4, 1, 1)
+        mods.append(("exposure", 7, params.hex(), _SCENE_DEFAULT, _BLENDOP_EXPOSURE))
+    if adj.contrast:
+        floats = _FILMIC_FLOATS.copy()
+        floats[14] = max(0.0, 1.0 + adj.contrast / 100)
+        mods.append(("filmicrgb", 6, struct.pack("<18f11i", *floats, *_FILMIC_INTS).hex(), _SCENE_DEFAULT, _BLENDOP))
+    if adj.clarity:
+        mods.append(("bilat", 3, struct.pack("<i4f", 0, 50, 50, 1.0 + adj.clarity / 100, 0.2).hex(), "", _BLENDOP))
     if adj.sharpness > 0:
-        items.append(_item("sharpen", 3, _encode_sharpen(adj.sharpness)))
-
-    # Noise reduction
+        mods.append(("sharpen", 1, struct.pack("<3f", 2.0, adj.sharpness / 100, 0.5).hex(), "", _BLENDOP))
     if adj.noise_reduction > 0:
-        items.append(_item("denoiseprofile", 10, _encode_denoiseprofile(adj.noise_reduction)))
+        mods.append(("denoiseprofile", 12, _DENOISE_CHROMA, "", _BLENDOP))
+    if crop:
+        # crop v3: left, top, right, bottom (normalised), ratio_d/ratio_n 0 = freehand
+        params = struct.pack("<4f2i", crop.left, crop.top, crop.right, crop.bottom, 0, 0)
+        mods.append(("crop", 3, params.hex(), "", _BLENDOP))
 
-    # Vignette
-    if adj.vignette != 0.0:
-        items.append(_item("vignette", 5, _encode_vignette(adj.vignette)))
-
-    # Crop (darktable treats crop as a module too)
-    if edit_state.crop:
-        items.append(_item("crop", 5, _encode_crop(edit_state.crop)))
-
-    xmp_content = _XMP_TEMPLATE.format(
-        history_end=len(items),
-        history_items="".join(items),
+    items = "".join(
+        _ITEM.format(num=i, op=op, ver=ver, params=p, name=name, blendop=b)
+        for i, (op, ver, p, name, b) in enumerate(mods)
     )
-
-    xmp_path = edit_state.source_path.with_suffix(".xmp")
-    xmp_path.write_text(xmp_content, encoding="utf-8")
+    xmp_path.write_text(_HEADER.format(source=src.name, end=len(mods), items=items), encoding="utf-8")
     return xmp_path
